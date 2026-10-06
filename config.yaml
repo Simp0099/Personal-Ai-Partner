@@ -2,7 +2,7 @@
 # Centralized config — all settings are loaded dynamically by jarvis/config.py
 
 assistant:
-  name: "Kyuoko Hori"
+  name: "Ai Partner"
   greeting_name: "Boss"
   default_language: "en-in"
 

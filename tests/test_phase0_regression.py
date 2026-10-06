@@ -450,7 +450,10 @@ class TestToolChain:
         brain = brain_with(chat)
         with patch.dict(TOOL_REGISTRY, {"tell_time": boom}):
             reply = brain.ask("x")
-        assert reply == "Sorry about that."
+        # Phase 2 appends an honest-failure note so a failed action cannot read
+        # as a completed one. The model's own text is still preserved.
+        assert reply.startswith("Sorry about that.")
+        assert "Error executing 'tell_time'" in reply
         tool_turn = _sent_tool_results(chat)[0]
         assert "Error" in tool_turn["results"][0]["result"]
 

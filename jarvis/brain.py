@@ -31,6 +31,7 @@ from jarvis.config import (
     JARVIS_SYSTEM_PROMPT,
     DEFAULT_CITY,
     LLM_MODEL,
+    GREETING_NAME,
 )
 from jarvis.tools import (
     web,
@@ -42,6 +43,7 @@ from jarvis.tools import (
     general,
     system_tools,
 )
+from jarvis import behavior
 from jarvis import memory
 from jarvis.logger import logger, StatusIndicator
 from jarvis.model_layer import (
@@ -85,16 +87,80 @@ def get_memory_conn():
 
 
 def _build_system_prompt() -> str:
-    """Build the system prompt with recalled long-term memories injected.
+    """Build the base identity prompt.
+
+    Identity only. Long-term memory is deliberately *not* appended here: the
+    prompt defines who Ai Partner is, while memory defines what it knows about
+    the user, and the two are retrieved on different schedules. Memory is added
+    per turn by :func:`_build_context_block`, which can scope it to the request.
 
     The same identity is passed to every compatible model, so switching models
     does not change who the AI Partner is.
 
     Returns:
-        The base system prompt with any stored user facts appended.
+        The base system prompt.
     """
-    facts = memory.recall_all(get_memory_conn())
-    return JARVIS_SYSTEM_PROMPT + memory.format_facts_for_prompt(facts)
+    return JARVIS_SYSTEM_PROMPT
+
+
+def _build_context_block(
+    message: str,
+    classification: Any,
+    history: List[Dict[str, Any]],
+) -> str:
+    """Build the per-turn context: relevant memory, then behavioral posture.
+
+    Retrieval is scoped to this request rather than dumping the whole store,
+    so an unrelated question does not carry a page of project history with it.
+
+    Args:
+        message: The user's message this turn.
+        classification: The Brain's read of the request, for the directive.
+        history: This conversation's earlier turns.
+
+    Returns:
+        Prompt text, or an empty string when there is nothing to add.
+    """
+    parts = []
+
+    try:
+        # Query on the current message plus recent turns: "keep going" is only
+        # resolvable if the last few turns are part of the query.
+        recent = " ".join(
+            str(m.get("content") or "") for m in history[-4:] if m.get("role") == "user"
+        )
+        facts = memory.recall_relevant(get_memory_conn(), f"{message} {recent}")
+    except Exception as e:  # noqa: BLE001 - memory must never break a turn
+        logger.warning(f"Memory retrieval skipped: {e}")
+        facts = []
+
+    if facts:
+        parts.append(memory.format_facts_for_prompt(facts))
+
+    # Existing keys are only fetched for turns that might write, and only so a
+    # correction can reuse one instead of inventing a second key.
+    subjects: List[str] = []
+    if behavior.memory_posture(message):
+        try:
+            subjects = memory.active_subjects(get_memory_conn())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Subject listing skipped: {e}")
+
+    posture = behavior.memory_context(facts, GREETING_NAME)
+    intent = behavior.memory_posture(message, subjects)
+    if intent:
+        posture = f"{posture}\n- {intent}" if posture else f"- {intent}"
+    if posture:
+        parts.append("\n\n## Context\n" + posture)
+
+    directive = behavior.turn_directive(
+        classification,
+        has_history=bool(history),
+    )
+    if directive:
+        parts.append("\n\n## This turn\n" + directive)
+
+    return "".join(parts)
 
 
 def _model_candidates() -> List[str]:
@@ -262,34 +328,79 @@ def get_system_status() -> str:
 
 # --- Memory Tools ---
 
-def save_memory(fact: str, category: str = "general") -> str:
-    """Save a fact, preference, or note to long-term memory for future sessions.
+def save_memory(
+    fact: str,
+    category: str = "general",
+    subject: str = "",
+    source: str = "inferred",
+) -> str:
+    """Save a fact, preference, decision, or project note to long-term memory.
 
     Args:
-        fact: The fact or information to remember about the user.
-        category: Optional category like 'preference', 'fact', or 'note'. Defaults to 'general'.
+        fact: The durable information to remember.
+        category: One of preference, project, goal, decision, context, general.
+        subject: Stable key so a later correction replaces this entry instead of
+            contradicting it (e.g. 'user:name'). Defaults to the fact text.
+        source: 'explicit' when the user asked for it to be remembered.
 
     Returns:
-        Confirmation message indicating whether the fact was saved.
+        Confirmation only when the write actually succeeded.
     """
+    if not (fact or "").strip():
+        return "Nothing to save -- the fact was empty."
     try:
         conn = get_memory_conn()
-        success = memory.remember(conn, fact, category)
-        if success:
-            count = memory.get_memory_count(conn)
-            StatusIndicator.memory(f"Saved fact #{count}: '{fact}'")
-            return f"Got it, Boss. I've saved that to long-term memory (fact #{count}). I won't forget."
-        return "Sorry, I couldn't save that to memory. Try again."
+        if not memory.remember(
+            conn, fact, category, subject=subject or None, source=source
+        ):
+            # Never promise persistence that did not happen.
+            return "I couldn't save that to memory. It has not been stored."
+
+        count = memory.get_memory_count(conn)
+        StatusIndicator.memory(f"Saved fact #{count}: '{fact}'")
+        superseded = ""
+        if subject:
+            superseded = " It replaced the earlier version of this."
+        return f"Stored in long-term memory (fact #{count}).{superseded}"
     except Exception as e:
         logger.error(f"save_memory failed: {e}", exc_info=True)
-        return "Sorry, I couldn't save that to memory. Try again."
+        return "I couldn't save that to memory. It has not been stored."
+
+
+def forget_memory(query: str) -> str:
+    """Forget stored information the user asks to be forgotten.
+
+    Deactivates matching memories so they are no longer retrieved. Reports
+    honestly when nothing matched.
+
+    Args:
+        query: Free text identifying what to forget.
+
+    Returns:
+        Confirmation listing what was forgotten, or a message if none matched.
+    """
+    if not (query or "").strip():
+        return "Nothing to forget -- no description was given."
+    try:
+        conn = get_memory_conn()
+        forgotten = memory.forget_matching(conn, query)
+        if forgotten:
+            for fact in forgotten:
+                StatusIndicator.memory(f"Forgotten: '{fact}'")
+            listed = "; ".join(forgotten)
+            return f"Forgotten and no longer retrieved: {listed}"
+        return f"Nothing in memory matched '{query}', so nothing was forgotten."
+    except Exception as e:
+        logger.error(f"forget_memory failed: {e}", exc_info=True)
+        return "I couldn't reach memory just now, so nothing was forgotten."
 
 
 def recall_memories(query: str = "") -> str:
     """Recall facts from long-term memory, optionally filtered by a search query.
 
     Args:
-        query: Optional search term to filter memories. If empty, returns all stored facts.
+        query: Optional search term to filter memories. If empty, returns all
+            active stored facts.
 
     Returns:
         A formatted list of recalled facts, or a message if none match.
@@ -304,15 +415,15 @@ def recall_memories(query: str = "") -> str:
                 for i, fact in enumerate(facts, 1):
                     lines.append(f"  {i}. {fact}")
                 return "\n".join(lines)
-            return f"I don't have anything stored about '{query}', Boss."
+            return f"Nothing in memory matches '{query}'."
 
         facts = memory.recall_all(conn)
         if facts:
-            lines = ["Here's everything I remember about you:"]
+            lines = ["Here's everything I currently remember:"]
             for i, fact in enumerate(facts, 1):
                 lines.append(f"  {i}. {fact}")
             return "\n".join(lines)
-        return "My long-term memory is empty, Boss. Tell me something about yourself and I'll remember it."
+        return "My long-term memory is empty. Tell me something about yourself and I'll remember it."
     except Exception as e:
         logger.error(f"recall_memories failed: {e}", exc_info=True)
         return "Sorry, I had trouble accessing my memory. Try again."
@@ -337,6 +448,7 @@ GEMINI_TOOLS = [
     get_system_status,
     save_memory,
     recall_memories,
+    forget_memory,
 ]
 
 #: Neutral name for the tool set; kept under the old name for compatibility.
@@ -356,6 +468,7 @@ NON_IDEMPOTENT_TOOLS = frozenset({
     "open_maps",
     "take_screenshot",
     "save_memory",
+    "forget_memory",
 })
 
 
@@ -380,6 +493,9 @@ class JarvisBrain:
         #: Neutral conversation history, oldest first. Owned here, not by a model.
         self._history: List[Dict[str, Any]] = []
         self._system_prompt = ""
+        #: Per-turn context: relevant memory + behavioral layer. Recomputed each
+        #: turn, because relevance depends on what is being asked.
+        self._turn_context = ""
         self._message_count = 0
         # One in-flight request per conversation, so overlapping requests cannot
         # interleave and reorder the user's messages.
@@ -408,7 +524,13 @@ class JarvisBrain:
         return spec
 
     def _create_chat(self, model: Any, history: Optional[List[Dict[str, Any]]] = None) -> ChatSession:
-        """Open a provider session for `model`, seeded with prior history."""
+        """Open a provider session for `model`, seeded with prior history.
+
+        The Phase 1 identity prompt is cached on the instance and reused for the
+        whole conversation. This turn's context block -- relevant memory plus
+        behavioral posture -- is appended to it, so memory stays request-scoped
+        while identity stays stable.
+        """
         spec = self._resolve_spec(model)
         provider = self.layer.providers.get(spec.provider)
         if provider is None:
@@ -421,9 +543,13 @@ class JarvisBrain:
 
         self._system_prompt = self._system_prompt or _build_system_prompt()
 
+        system_prompt = self._system_prompt
+        if self._turn_context:
+            system_prompt += self._turn_context
+
         session = provider.open_session(
             model_id=spec.model_id,
-            system_prompt=self._system_prompt,
+            system_prompt=system_prompt,
             tools=GEMINI_TOOLS,
             history=list(history or []),
             **self.layer.options_for(spec),
@@ -456,6 +582,7 @@ class JarvisBrain:
                 pass
         self._session = None
         self._history = []
+        self._turn_context = ""
         self._message_count = 0
 
     def _record(self, *messages: Dict[str, Any]) -> None:
@@ -557,6 +684,11 @@ class JarvisBrain:
         )
         context_tokens = estimate_tokens(self._history) + estimate_tokens([{"content": message}])
 
+        # Phase 2: relevant long-term memory plus this turn's behavioral posture.
+        # Deterministic, no extra model call -- the classification already
+        # exists for model selection.
+        self._turn_context = _build_context_block(message, classification, self._history)
+
         ranked = self.layer.plan(classification, context_tokens=context_tokens)
 
         if DEBUG_INPUT:
@@ -615,6 +747,11 @@ class JarvisBrain:
                 logger.info(f"[MODEL OUTPUT] session={self.conversation_id} model={spec.key} "
                             f"latency={latency:.2f}s")
 
+            # Duplicate-execution safety spans attempts (a side effect must not
+            # replay across a model switch), but the failure note must describe
+            # only the attempt that actually produced this reply.
+            attempt_results: List[str] = []
+
             try:
                 reply = self._run_tool_loop(
                     session=session,
@@ -622,6 +759,7 @@ class JarvisBrain:
                     response=response,
                     turn_messages=turn_messages,
                     executed_this_turn=executed_this_turn,
+                    attempt_results=attempt_results,
                 )
             except ProviderError as e:
                 self.layer.record_failure(spec, e)
@@ -630,6 +768,9 @@ class JarvisBrain:
                 if not e.retryable:
                     raise BrainError(_friendly_error_message(e), detail="; ".join(failures)) from e
                 continue
+
+            # Phase 2: a turn whose tools all failed must not read as a success.
+            reply += behavior.tool_failure_note(attempt_results)
 
             # Commit the turn: user message plus everything the model produced.
             self._record({"role": "user", "content": message}, *turn_messages)
@@ -655,6 +796,7 @@ class JarvisBrain:
         response: ModelResponse,
         turn_messages: List[Dict[str, Any]],
         executed_this_turn: Dict[str, str],
+        attempt_results: Optional[List[str]] = None,
     ) -> str:
         """Serve tool requests until the model returns text.
 
@@ -698,6 +840,8 @@ class JarvisBrain:
                     executed_this_turn[cache_key] = result
 
                 StatusIndicator.tool_result(tool_name, result)
+                if attempt_results is not None:
+                    attempt_results.append(result)
 
                 assistant_calls.append({
                     "id": call.id, "name": tool_name, "arguments": tool_args,

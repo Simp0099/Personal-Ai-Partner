@@ -307,13 +307,13 @@ class TestBrainIntegration:
     """Checklist Item 2: Brain + Persona integration."""
 
     def test_persona_in_system_prompt(self):
-        """Verify Kyuoko Hori persona is in the system prompt."""
+        """Verify the Ai Partner persona is in the system prompt."""
         from jarvis.config import JARVIS_SYSTEM_PROMPT
 
-        assert "Kyuoko Hori" in JARVIS_SYSTEM_PROMPT
-        assert "Boss" in JARVIS_SYSTEM_PROMPT
-        assert "Horimiya" in JARVIS_SYSTEM_PROMPT
-        assert "sarcastic" in JARVIS_SYSTEM_PROMPT
+        assert "Ai Partner" in JARVIS_SYSTEM_PROMPT
+        assert "Honesty" in JARVIS_SYSTEM_PROMPT
+        assert "Proactiveness" in JARVIS_SYSTEM_PROMPT
+        assert "User agency" in JARVIS_SYSTEM_PROMPT
 
     def test_brain_initialization(self):
         """Verify JarvisBrain can be created."""
@@ -437,10 +437,10 @@ class TestEndToEndPipeline:
         assert len(GEMINI_TOOLS) >= 15
 
         # Verify config
-        assert ASSISTANT_NAME == "Kyuoko Hori"
+        assert ASSISTANT_NAME == "Ai Partner"
         assert GREETING_NAME == "Boss"
         assert "gemini" in LLM_MODEL
-        assert "Kyuoko Hori" in JARVIS_SYSTEM_PROMPT
+        assert "Ai Partner" in JARVIS_SYSTEM_PROMPT
         assert WAKE_WORD_MODEL == "hey_jarvis"
 
 

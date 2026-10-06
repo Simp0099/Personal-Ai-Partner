@@ -693,7 +693,12 @@ class TestConversationContinuity:
         assert _provider(layer).sent[-1]["text"] == "What is my name?"
 
     def test_same_system_identity_across_all_providers_and_models(self):
-        """Identity is the AI Partner's, not the model's."""
+        """Identity is the AI Partner's, not the model's.
+
+        Phase 2 appends a per-turn behavioral directive, so the full prompt is
+        no longer a fixed string. What must stay identical across every
+        provider and model is the identity base it is built on.
+        """
         layer = build_layer(
             models=[
                 {"key": "gem", "provider": "provA", "model": "mA", "priority": 100,
@@ -707,11 +712,16 @@ class TestConversationContinuity:
         brain.ask("Why?")
         brain.ask("Why again?")
 
-        prompts = set()
+        identities = set()
         for provider in layer.providers.values():
             for record in provider.sessions:
-                prompts.add(record.system_prompt)
-        assert prompts == {"IDENTITY"}, f"inconsistent system identity: {prompts}"
+                assert record.system_prompt.startswith("IDENTITY"), (
+                    f"identity base lost: {record.system_prompt!r}"
+                )
+                # Everything after the identity base is per-turn context
+                # (memory / behavioral posture), which is expected to vary.
+                identities.add(record.system_prompt.split("\n## ")[0].strip())
+        assert identities == {"IDENTITY"}, f"inconsistent system identity: {identities}"
 
     def test_system_prompt_passed_to_every_model(self):
         layer = build_layer(
@@ -727,7 +737,9 @@ class TestConversationContinuity:
         brain.ask("Why?")
         for provider in layer.providers.values():
             for record in provider.sessions:
-                assert record.system_prompt == "IDENTITY"
+                assert record.system_prompt.startswith("IDENTITY"), (
+                    f"identity missing from {record.system_prompt!r}"
+                )
 
     def test_tools_are_offered_to_every_model(self):
         layer = build_layer(
