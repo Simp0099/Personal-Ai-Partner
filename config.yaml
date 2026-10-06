@@ -1,0 +1,311 @@
+# JARVIS 2.0 User Configuration
+# Centralized config — all settings are loaded dynamically by jarvis/config.py
+
+assistant:
+  name: "Kyuoko Hori"
+  greeting_name: "Boss"
+  default_language: "en-in"
+
+llm:
+  provider: "gemini"
+  model: "gemini-3.6-flash"
+  # Legacy single-model fallback list, retained for compatibility.
+  # Phase 0.5 routing uses the `models:` + `routing:` blocks below instead.
+  fallback_models:
+    - "gemini-3.5-flash-lite"
+  max_model_attempts: 2
+  max_tool_rounds: 8          # Safety bound on tool-call round trips per user message
+  temperature: 0.7
+  max_output_tokens: 1024
+  max_history_messages: 20    # Cap conversation history to control token usage
+
+# ============================================================================
+# Phase 0.5 — provider-agnostic model layer
+# ============================================================================
+# Providers are defined here; credentials come from the environment variable
+# named by `api_key_env`. Never put a key in this file.
+providers:
+
+  gemini:
+    type: gemini
+    enabled: true
+    api_key_env: GEMINI_API_KEY
+    default_model: "gemini-3.6-flash"
+    context_window: 1048576
+
+  openrouter:
+    type: openai_compatible
+    enabled: true
+    api_key_env: OPENROUTER_API_KEY
+    base_url: "https://openrouter.ai/api/v1"
+    context_window: 1000000
+
+  # OpenCode Zen serves an OpenAI-compatible API and hosts the community
+  # "Space Bunny" / "Big Pickle" models. Verified against its /models endpoint;
+  # these are NOT OpenRouter models.
+  opencode_zen:
+    type: openai_compatible
+    enabled: true
+    api_key_env: OPENCODE_ZEN_API_KEY
+    base_url: "https://opencode.ai/zen/v1"
+    context_window: 1048576
+
+# ---------------------------------------------------------------------------
+# Model registry. Adding/removing/disabling a model is a change to this block
+# only — no Python edits required.
+#
+# `verified: true` means the model id, context length, free status and
+# tool-calling support were checked against the live provider catalog.
+# `verified: false` means those claims are UNCONFIRMED; the router penalises
+# unverified models so they cannot silently outrank verified ones.
+# ---------------------------------------------------------------------------
+models:
+
+  # ---- Google Gemini (verified live) ----
+  gemini_flash:
+    provider: gemini
+    model: "gemini-3.6-flash"
+    enabled: true
+    priority: 90
+    free: false
+    context_window: 1048576
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Returned 429 on the free tier during testing; gemini_3_5_flash_lite responded."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: true
+      structured_output: true
+      long_context: true
+      streaming: true
+    task_affinity:
+      coding: 10
+      reasoning: 10
+
+  gemini_flash_lite:
+    provider: gemini
+    model: "gemini-3.5-flash-lite"
+    enabled: true
+    priority: 70
+    free: false
+    context_window: 1048576
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Confirmed responding live ('2+2' -> '4') when gemini-3.6-flash was quota-limited."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: true
+      structured_output: true
+      long_context: true
+      streaming: true
+    task_affinity:
+      casual_conversation: 10
+
+  # ---- OpenRouter free models (catalog-verified, live calls unverified) ----
+  nemotron_3_5_lightning:
+    provider: openrouter
+    model: "nvidia/nemotron-3.5-lightning:free"
+    enabled: true
+    priority: 85
+    free: true
+    context_window: 1000000
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Catalog confirms 1M context and tools support. Live call unverified: no OPENROUTER_API_KEY configured."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: false
+      structured_output: true
+      long_context: true
+      streaming: true
+    task_affinity:
+      coding: 15
+      reasoning: 15
+
+  nemotron_3_ultra:
+    provider: openrouter
+    model: "nvidia/nemotron-3-ultra-550b-a55b:free"
+    enabled: true
+    priority: 80
+    free: true
+    context_window: 1000000
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Catalog confirms 1M context and tools support. Live call unverified."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: false
+      structured_output: true
+      long_context: true
+      streaming: true
+    task_affinity:
+      reasoning: 20
+
+  nemotron_3_super:
+    provider: openrouter
+    model: "nvidia/nemotron-3-super-120b-a12b:free"
+    enabled: true
+    priority: 75
+    free: true
+    context_window: 262144
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Catalog confirms 256k context and tools support. Live call unverified."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: false
+      structured_output: true
+      long_context: true
+      streaming: true
+
+  inclusionai_ling_3_flash:
+    provider: openrouter
+    model: "inclusionai/ling-3.0-flash-sante:free"
+    enabled: true
+    priority: 70
+    free: true
+    context_window: 262144
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "Catalog confirms 256k context and tools support. Live call unverified."
+    capabilities:
+      reasoning: false
+      coding: true
+      conversation: true
+      tool_calling: true
+      vision: false
+      structured_output: false
+      long_context: true
+      streaming: true
+    task_affinity:
+      casual_conversation: 15
+
+  # ---- OpenCode Zen community free models (catalog-verified) ----
+  space_bunny_free:
+    provider: opencode_zen
+    model: "space-bunny-free"
+    enabled: true
+    priority: 78
+    free: true
+    context_window: 1048576
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "ID verified on https://opencode.ai/zen/v1/models. NOT an OpenRouter model. Live call unverified: no OPENCODE_ZEN_API_KEY configured."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: false
+      vision: false
+      structured_output: false
+      long_context: true
+      streaming: false
+
+  # KNOWN ROUTING ISSUE — disabled until API accessibility is verified.
+  # `big-pickle` is listed in the Zen catalog and is priced Free, but a live
+  # call returned HTTP 403 {"type":"FreeTierError","message":"OpenCode's free
+  # tier can only be used from within OpenCode"}. It is therefore unusable
+  # from this client. Keeping it enabled was actively harmful: the 403 is
+  # classified as an auth error (non-retryable), so selecting it aborted the
+  # whole request instead of falling back. Re-enable only after a live call
+  # from outside the OpenCode client succeeds.
+  big_pickle:
+    provider: opencode_zen
+    model: "big-pickle"
+    enabled: false
+    priority: 68
+    free: true
+    context_window: 262144
+    max_output_tokens: 8192
+    verified: true
+    verified_on: "2026-10-06"
+    notes: "ID and $0 pricing verified against https://opencode.ai/docs/zen and the /models catalog. DISABLED: live call returned HTTP 403 FreeTierError ('free tier can only be used from within OpenCode'), so it cannot be routed to from this client. tool_calling marked false because the Zen catalog does not advertise it and generation is blocked entirely."
+    capabilities:
+      reasoning: true
+      coding: true
+      conversation: true
+      tool_calling: false
+      vision: false
+      structured_output: false
+      long_context: true
+      streaming: false
+    task_affinity:
+      creative: 15
+
+# ---------------------------------------------------------------------------
+# Router configuration. Deterministic weighted scoring; no model calls, no ML.
+# ---------------------------------------------------------------------------
+routing:
+  enabled: true
+  strategy: capability_score
+
+  # Weights sum to 1.0 (normalised at load time).
+  capability_weight: 0.30    # can the model actually do this task
+  task_weight: 0.25          # declared affinity for the classified task
+  reliability_weight: 0.25   # measured success rate
+  latency_weight: 0.10       # measured latency, bounded so it cannot dominate
+  priority_weight: 0.10      # operator-configured preference
+
+  cooldown_seconds: 60       # base backoff after a retryable failure
+  max_attempts: 4            # max models tried in one request before failing
+  probe_cooling_models: true # retry the nearest-to-expiry model instead of deadlocking
+  prefer_free: true
+  latency_reference_ms: 4000 # latency at which the latency score reaches ~0.5
+
+debug:
+  # Development-only: log exact user input, routing decision, chosen model.
+  log_input: false
+  endpoints: true            # expose GET /api/models for development
+
+weather:
+  default_city: "Delhi"
+
+contacts:
+  # Email contact aliases
+  # mom: "example_mom@gmail.com"
+  # primary: "user@example.com"
+
+locations:
+  # Optional custom map search target
+  default_maps_query: "Delhi"
+
+speech:
+  # TTS Engine: "kokoro" (natural AI voice, local & free) or "pyttsx3" (basic fallback)
+  tts_engine: "kokoro"
+  kokoro_voice: "am_adam"     # Voices: am_adam, am_michael, af_sarah, af_bella, bf_emma, bm_george
+  kokoro_lang: "a"           # 'a' for American English, 'b' for British English
+  kokoro_speed: 1.0          # Speed multiplier (e.g. 1.0, 1.1)
+  pyttsx3_rate: 180
+
+wake_word:
+  # openWakeWord settings (Phase 6)
+  model: "hey_jarvis"        # Pre-trained model: hey_jarvis, hey_mycroft, alexa, etc.
+  threshold: 0.5             # Confidence threshold (0.0-1.0), higher = more strict
+
+logging:
+  # Phase 8: Rotating file logging
+  level: "INFO"              # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  max_bytes: 1000000         # 1 MB per log file before rotation
+  backup_count: 3            # Number of backup files to keep
