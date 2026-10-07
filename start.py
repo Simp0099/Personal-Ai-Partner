@@ -79,12 +79,19 @@ def check_environment():
     except ImportError:
         print(f"[Check] openwakeword: Not installed")
 
-    # Check Kokoro TTS
+    # Check Chatterbox TTS (active voice engine) and its reference audio
     try:
-        import kokoro  # noqa: F401
-        print(f"[Check] Kokoro TTS: Available")
+        from jarvis.speech import _resolve_chatterbox_reference
+        _resolve_chatterbox_reference()
+        print(f"[Check] Chatterbox TTS: reference audio found")
+    except Exception as e:
+        print(f"[Check] Chatterbox TTS: {e}")
+
+    try:
+        import chatterbox  # noqa: F401
+        print(f"[Check] Chatterbox package: Installed")
     except ImportError:
-        print(f"[Check] Kokoro TTS: Not available (requires Python 3.10-3.12)")
+        print(f"[Check] Chatterbox package: Not installed (pip install chatterbox-tts)")
 
     # System info
     print(f"\n[Info] OS: {platform.system()} {platform.release()}")

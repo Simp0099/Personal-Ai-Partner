@@ -29,6 +29,8 @@ venv312/
 venv314/
 venv/
 .venv/
+.venv311/
+.venv312/
 env/
 ENV/
 

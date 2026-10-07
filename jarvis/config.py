@@ -184,11 +184,28 @@ DEFAULT_MAPS_QUERY = CONFIG.get("locations", {}).get("default_maps_query", "Delh
 CONTACTS = CONFIG.get("contacts", {}) or {}
 
 # Speech & TTS Settings
-TTS_ENGINE = CONFIG.get("speech", {}).get("tts_engine", "kokoro")
-KOKORO_VOICE = CONFIG.get("speech", {}).get("kokoro_voice", "am_adam")
-KOKORO_LANG = CONFIG.get("speech", {}).get("kokoro_lang", "a")
-KOKORO_SPEED = float(CONFIG.get("speech", {}).get("kokoro_speed", 1.0))
-PYTTSX3_RATE = int(CONFIG.get("speech", {}).get("pyttsx3_rate", 180))
+# Chatterbox is the active engine. Paths are relative to PROJECT_ROOT (the repo
+# root, i.e. the Model/ directory) unless absolute.
+_SPEECH = CONFIG.get("speech", {}) or {}
+
+TTS_ENGINE = _SPEECH.get("tts_engine", "chatterbox")
+
+# Chatterbox: voice identity comes from the reference WAV, not from a voice id.
+CHATTERBOX_REFERENCE_AUDIO = _SPEECH.get("chatterbox_reference_audio", "chatterbox_emotion_test.wav")
+CHATTERBOX_DEVICE = _SPEECH.get("chatterbox_device", "auto")  # auto | mps | cuda | cpu
+CHATTERBOX_EXAGGERATION = float(_SPEECH.get("chatterbox_exaggeration", 0.5))
+CHATTERBOX_CFG_WEIGHT = float(_SPEECH.get("chatterbox_cfg_weight", 0.5))
+CHATTERBOX_TEMPERATURE = float(_SPEECH.get("chatterbox_temperature", 0.8))
+# What to do when Chatterbox fails: "console" (default, no audio) or "pyttsx3".
+# There is deliberately no silent fallback to Kokoro.
+CHATTERBOX_FALLBACK_ENGINE = _SPEECH.get("chatterbox_fallback_engine", "console")
+
+# Kokoro: legacy, only used if speech.tts_engine is explicitly set back to "kokoro".
+KOKORO_VOICE = _SPEECH.get("kokoro_voice", "am_adam")
+KOKORO_LANG = _SPEECH.get("kokoro_lang", "a")
+KOKORO_SPEED = float(_SPEECH.get("kokoro_speed", 1.0))
+
+PYTTSX3_RATE = int(_SPEECH.get("pyttsx3_rate", 180))
 
 # Wake Word Settings (Phase 6 - openWakeWord)
 WAKE_WORD_MODEL = CONFIG.get("wake_word", {}).get("model", "hey_jarvis")

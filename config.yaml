@@ -292,8 +292,20 @@ locations:
   default_maps_query: "Delhi"
 
 speech:
-  # TTS Engine: "kokoro" (natural AI voice, local & free) or "pyttsx3" (basic fallback)
-  tts_engine: "kokoro"
+  # TTS Engine: "chatterbox" (active, voice-cloned from a reference WAV),
+  # "kokoro" (legacy) or "pyttsx3" (basic platform TTS)
+  tts_engine: "chatterbox"
+  # Chatterbox voice identity. Path relative to the project root (this repo's
+  # Model/ directory); an absolute path also works.
+  chatterbox_reference_audio: "chatterbox_emotion_test.wav"
+  chatterbox_device: "auto"    # auto -> mps/cuda when available, else cpu
+  chatterbox_exaggeration: 0.5
+  chatterbox_cfg_weight: 0.5
+  chatterbox_temperature: 0.8
+  # What to do if Chatterbox fails: "console" (default, text only) or "pyttsx3".
+  # Chatterbox never silently falls back to Kokoro.
+  chatterbox_fallback_engine: "console"
+  # Legacy Kokoro settings (unused unless tts_engine is set back to "kokoro")
   kokoro_voice: "am_adam"     # Voices: am_adam, am_michael, af_sarah, af_bella, bf_emma, bm_george
   kokoro_lang: "a"           # 'a' for American English, 'b' for British English
   kokoro_speed: 1.0          # Speed multiplier (e.g. 1.0, 1.1)

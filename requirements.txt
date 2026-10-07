@@ -17,13 +17,17 @@ Pillow>=10.0.0
 pywhatkit>=5.4
 
 # Speech I/O (STT / TTS) — Phase 5
-# Kokoro TTS requires Python 3.10-3.12 (spacy/blis Cython deps fail on 3.13+)
-# Uncomment below if using Python 3.10-3.12:
-# kokoro>=0.7.0
-# sounddevice>=0.4.6
-# soundfile>=0.12.1
-# pyttsx3>=2.90
+# Chatterbox TTS (active voice engine) requires Python 3.10-3.13 (torch deps).
+# Voice identity comes from Model/chatterbox_emotion_test.wav, not a voice id.
+chatterbox-tts>=0.1.7
+sounddevice>=0.4.6
+soundfile>=0.12.1
+# resemble-perth (a chatterbox dep) still imports pkg_resources, removed in setuptools 81
+setuptools<81
+# Optional STT + legacy Kokoro/pyttsx3 engines (Python 3.10-3.12 only for kokoro)
 # SpeechRecognition>=3.10.0
+# pyttsx3>=2.90
+# kokoro>=0.7.0
 
 # Wake Word Detection (Phase 6 - openWakeWord)
 openwakeword>=0.6.0

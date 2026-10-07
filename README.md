@@ -7,11 +7,11 @@ Welcome to **JARVIS 2.0**, an AI companion upgraded from a monolithic keyword-ma
   - Modular package structure (`jarvis/`, `jarvis/tools/`)
   - Zero hardcoded secrets (`.env` and `python-dotenv`)
   - Cross-platform file paths and execution via `pathlib` and `subprocess`
-  - Cross-platform speech synthesis & recognition (Kokoro TTS / pyttsx3)
+  - Cross-platform speech synthesis & recognition (Chatterbox TTS / pyttsx3)
 - [x] **Phase 2: The Brain Swap** (Google Gemini `gemini-3.5-flash` + autonomous tool calling via Chat API)
 - [x] **Phase 3: Memory System** (Session memory via Chat API + SQLite durable long-term storage)
 - [x] **Phase 4: Character & Personality** (Kyuoko Hori persona from Horimiya — system prompt engineering)
-- [x] **Phase 5: Voice Upgrade** (Kokoro TTS local neural voice — requires Python 3.10-3.12)
+- [x] **Phase 5: Voice Upgrade** (Chatterbox TTS local neural voice, cloned from `Model/chatterbox_emotion_test.wav`)
 - [x] **Phase 6: Wake Word** (openWakeWord local offline detection — "hey jarvis")
 - [x] **Phase 7: Resource Efficiency** (History capped at 20, idle wake-word listener, no local LLM)
 - [x] **Phase 8: Production Polish** (Rotating logging, robust error handling, centralized config, CLI status indicators)
