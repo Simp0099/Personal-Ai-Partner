@@ -345,7 +345,7 @@ def run_verification_test() -> None:
         original = jarvis_brain.TOOL_REGISTRY["get_system_time"]
         jarvis_brain.TOOL_REGISTRY["get_system_time"] = lambda: (calls.append(1), "12:00")[1]
         try:
-            reply = brain.ask("What time is it?")
+            reply = brain.ask("check my inbox")
         finally:
             jarvis_brain.TOOL_REGISTRY["get_system_time"] = original
 
@@ -380,7 +380,7 @@ def run_verification_test() -> None:
             behaviours={"nt": scripted_reply("nt"), "wt": scripted_reply("wt")},
         )
         brain = JarvisBrain(conversation_id="verify-tool", model_layer=layer)
-        brain.ask("What is the weather in Delhi?")
+        brain.ask("Search Wikipedia for black holes")
         return brain.last_model_key == "with_tools", f"selected {brain.last_model_key!r}"
 
     def check_honest_failure():

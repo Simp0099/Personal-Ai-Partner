@@ -75,7 +75,7 @@ class TestNormalMode:
     def test_success_shows_no_diagnostics(self, _output_state, capsys):
         configure_logging(debug=False)
         brain = _brain_answer()
-        assert brain.ask("What time is it?") == "It is 12:00."
+        assert brain.ask("Why is the sky blue?") == "It is 12:00."
         out, err = capsys.readouterr()
         for token in DIAGNOSTIC_TOKENS + ("provider", "model"):
             assert token not in out and token not in err
@@ -86,7 +86,7 @@ class TestNormalMode:
             error(ErrorKind.RATE_LIMIT, "HTTP 429 Too Many Requests: quota hit"))
         brain = JarvisBrain(model_layer=layer)
         with pytest.raises(BrainError) as excinfo:
-            brain.ask("What time is it?")
+            brain.ask("Why is the sky blue?")
         assert "429" not in excinfo.value.message  # user text stays concise
         assert "429" in excinfo.value.detail  # raw detail preserved for logs
         out, err = capsys.readouterr()
@@ -117,7 +117,7 @@ class TestDebugMode:
     def test_debug_shows_diagnostics_and_response(self, _output_state, capsys):
         configure_logging(debug=True)
         brain = _brain_answer()
-        assert brain.ask("What time is it?") == "It is 12:00."
+        assert brain.ask("Why is the sky blue?") == "It is 12:00."
         out, _ = capsys.readouterr()
         assert "[Thinking" in out  # StatusIndicator diagnostics visible
         assert "429" not in out
@@ -141,7 +141,7 @@ class TestLogFile:
         log_file = tmp_path / "phase1.log"
         configure_logging(debug=False, log_file=log_file)
         brain = _brain_answer()
-        brain.ask("What time is it?")
+        brain.ask("Why is the sky blue?")
         for h in logger.handlers:
             h.flush()
         out, err = capsys.readouterr()

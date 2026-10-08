@@ -327,7 +327,7 @@ class TestCameraFailures:
         brain = JarvisBrain(model_layer=_vision_layer("text answer"))
         perception = webcam.WebcamPerception(analyze=lambda *a: "", camera=camera)
         assert perception.start() is False
-        assert brain.ask("what time is it?") == "text answer"
+        assert brain.ask("hello") == "text answer"
 
     def test_failed_read_does_not_crash_the_loop(self):
         camera = FakeCamera(fail_after=0)

@@ -155,7 +155,7 @@ class TestToolRequirement:
             behaviours={"nt": reply("NT"), "wt": reply("WT")},
         )
         brain = JarvisBrain(model_layer=layer)
-        brain.ask("What is the weather in Delhi right now?")
+        brain.ask("Search Wikipedia for black holes")
         assert brain.last_model_key == "with_tools"
 
     def test_non_tool_model_is_excluded_even_at_top_priority(self):
@@ -189,7 +189,7 @@ class TestToolRequirement:
         original = brain_module.TOOL_REGISTRY["tell_time"]
         brain_module.TOOL_REGISTRY["tell_time"] = lambda: "12:00"
         try:
-            assert brain.ask("What time is it?") == "It is noon."
+            assert brain.ask("check my inbox") == "It is noon."
         finally:
             brain_module.TOOL_REGISTRY["tell_time"] = original
 
@@ -277,7 +277,7 @@ class TestFallback:
         )
         brain = JarvisBrain(model_layer=layer)
         with pytest.raises(BrainError):
-            brain.ask("What is the weather in Paris?")
+            brain.ask("Search Wikipedia for black holes")
         assert layer.health.peek("no_tools") is None, "non-tool fallback was attempted"
 
     def test_max_attempts_is_respected(self):

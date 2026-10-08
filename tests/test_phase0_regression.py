@@ -315,11 +315,11 @@ class TestNewInstructionWins:
         brain = brain_with(chat)
 
         with patch.dict(TOOL_REGISTRY, {"tell_time": lambda: "12:00"}):
-            brain.ask("What time is it?")
+            brain.ask("What is the system status?")
             brain.ask("Stop. Instead, explain photosynthesis.")
 
         assert _sent_user_texts(chat) == [
-            "What time is it?",
+            "What is the system status?",
             "Stop. Instead, explain photosynthesis.",
         ]
 
@@ -344,7 +344,7 @@ class TestNewInstructionWins:
         ])
         brain = brain_with(chat)
         with patch.dict(TOOL_REGISTRY, {"tell_time": lambda: "12:00"}):
-            brain.ask("What time is it?")
+            brain.ask("What is the system status?")
             brain.ask("Hello again")
         assert _sent_user_texts(chat)[-1] == "Hello again"
 

@@ -703,6 +703,20 @@ class JarvisBrain:
             logger.error(f"Tool '{name}' failed: {e}", exc_info=True)
             return f"Error executing '{name}': {e}"
 
+    def _try_local_intent(self, message: str) -> Optional[str]:
+        """Deterministic local command, or None to use the AI router.
+
+        Dispatches through the existing TOOL_REGISTRY, so no provider is
+        touched on a match. Never raises: doubt means fall-through.
+        """
+        try:
+            from jarvis.intents import handle as handle_local_intent
+        except Exception as e:  # noqa: BLE001 -- router optional, never fatal
+            logger.error(f"Local intent layer unavailable: {e}")
+            return None
+        result = handle_local_intent(message, self._execute_tool_call)
+        return result.response if result.matched else None
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -758,6 +772,20 @@ class JarvisBrain:
         # Serialize turns so rapid messages cannot interleave or reorder.
         with self._lock:
             self._ephemeral = ephemeral
+            # Phase 2: deterministic local intents run before any provider
+            # call. A match executes an existing registry tool with zero LLM
+            # involvement; no match falls through to the AI router unchanged.
+            # Ephemeral (perception) and image turns never match: a camera
+            # frame is an analysis request, not a user command.
+            if not ephemeral and not images:
+                local_response = self._try_local_intent(message)
+                if local_response is not None:
+                    self._trim_history()
+                    self._record(
+                        {"role": "user", "content": message},
+                        {"role": "assistant", "content": local_response},
+                    )
+                    return local_response
             # Only an ephemeral turn borrows the turn context. It has to hand it
             # back, or the conversation's next history rebuild would open a
             # session carrying a camera directive. A normal turn must NOT be

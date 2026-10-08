@@ -239,12 +239,12 @@ def _tool_layer(second_text=None, tool="tell_time", tools=None):
 
 class TestEmptyToolLoopResponse:
     def test_successful_tool_with_normal_reply(self):
-        reply_text = JarvisBrain(model_layer=_tool_layer("It is noon.")).ask("what time is it")
+        reply_text = JarvisBrain(model_layer=_tool_layer("It is noon.")).ask("check my inbox")
         assert reply_text == "It is noon."
 
     def test_successful_tool_with_empty_reply_surfaces_the_result(self):
         """The defect: this used to return 'Standing by, Boss.'"""
-        out = JarvisBrain(model_layer=_tool_layer(None)).ask("what time is it")
+        out = JarvisBrain(model_layer=_tool_layer(None)).ask("check my inbox")
         assert out != "Standing by, Boss."
         assert "tell_time" in out
         assert "Standing by" not in out
@@ -256,7 +256,7 @@ class TestEmptyToolLoopResponse:
         original = TOOL_REGISTRY["tell_time"]
         TOOL_REGISTRY["tell_time"] = boom
         try:
-            out = JarvisBrain(model_layer=_tool_layer("All set.")).ask("what time is it")
+            out = JarvisBrain(model_layer=_tool_layer("All set.")).ask("check my inbox")
         finally:
             TOOL_REGISTRY["tell_time"] = original
         assert "All set." in out
@@ -269,7 +269,7 @@ class TestEmptyToolLoopResponse:
         original = TOOL_REGISTRY["tell_time"]
         TOOL_REGISTRY["tell_time"] = boom
         try:
-            out = JarvisBrain(model_layer=_tool_layer(None)).ask("what time is it")
+            out = JarvisBrain(model_layer=_tool_layer(None)).ask("check my inbox")
         finally:
             TOOL_REGISTRY["tell_time"] = original
         assert "did not complete" in out

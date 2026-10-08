@@ -548,7 +548,7 @@ class TestWritePolicy:
                      "capabilities": {"reasoning": True, "tool_calling": True}}],
             behaviours={"mm": tool_then_reply("tell_time", "12:00", "It is noon.")},
         )
-        JarvisBrain(model_layer=layer).ask("what time is it")
+        JarvisBrain(model_layer=layer).ask("check my inbox")
         assert memory.get_memory_count(_no_real_db) == 0
 
 
@@ -567,7 +567,7 @@ class TestFailureHonesty:
         real = TOOL_REGISTRY["tell_time"]
         TOOL_REGISTRY["tell_time"] = lambda: (_ for _ in ()).throw(RuntimeError("tool exploded"))
         try:
-            reply = brain.ask("what time is it")
+            reply = brain.ask("check my inbox")
         finally:
             TOOL_REGISTRY["tell_time"] = real
         assert "Done." in reply
@@ -580,7 +580,7 @@ class TestFailureHonesty:
                      "capabilities": {"reasoning": True, "tool_calling": True}}],
             behaviours={"mm": tool_then_reply("tell_time", "12:00", "It is noon.")},
         )
-        assert "did not complete" not in JarvisBrain(model_layer=layer).ask("what time is it")
+        assert "did not complete" not in JarvisBrain(model_layer=layer).ask("check my inbox")
 
     def test_failed_memory_write_is_not_stored_as_done(self, monkeypatch):
         """A failed save must never leave a 'completed' memory behind."""
