@@ -52,6 +52,44 @@ def is_shutdown_request(query: str) -> bool:
     return normalized in SHUTDOWN_PHRASES
 
 
+def start_perception(brain) -> object:
+    """Start webcam perception if config.yaml enables it.
+
+    Explicitly opt-in: with ``vision.webcam.enabled: false`` this returns None
+    and the camera is never opened. Returns the started instance so the caller
+    can stop it in a ``finally`` — that is what releases the device.
+    """
+    from jarvis.webcam import start_webcam_perception
+
+    return start_webcam_perception(brain)
+
+
+def stop_perception() -> None:
+    """Release the camera, if one was opened. Safe to call unconditionally."""
+    from jarvis.webcam import stop_webcam_perception
+
+    stop_webcam_perception()
+
+
+def start_voice(brain) -> object:
+    """Start the voice conversation loop if config.yaml enables it.
+
+    Returns None when the wake word is disabled -- the microphone is never
+    opened, and text conversation is unaffected. Voice is a pathway, not the
+    brain.
+    """
+    from jarvis.voice_loop import start_voice_loop
+
+    return start_voice_loop(brain)
+
+
+def stop_voice() -> None:
+    """Cancel any turn and release the microphone. Safe to call unconditionally."""
+    from jarvis.voice_loop import stop_voice_loop
+
+    stop_voice_loop()
+
+
 def wish_me() -> None:
     """Time-sensitive greeting sequence."""
     hour = int(datetime.datetime.now().hour)
@@ -84,29 +122,35 @@ def run_assistant() -> None:
     set_interactive_prompting(True)
     wish_me()
     brain = JarvisBrain()
+    start_perception(brain)
+    voice = start_voice(brain)
 
-    while True:
-        query = listen().strip()
+    try:
+        while True:
+            query = listen().strip()
 
-        if not query or query.lower() == "none":
-            continue
+            if not query or query.lower() == "none":
+                continue
 
-        # Clean shutdown triggers (whole-utterance match only)
-        if is_shutdown_request(query):
-            StatusIndicator.shutdown()
-            speak(f"Going offline. You can call me anytime, {GREETING_NAME}!")
-            break
+            # Clean shutdown triggers (whole-utterance match only)
+            if is_shutdown_request(query):
+                StatusIndicator.shutdown()
+                speak(f"Going offline. You can call me anytime, {GREETING_NAME}!")
+                break
 
-        # Process through Gemini LLM Brain
-        try:
-            response = brain.ask(query)
-            speak(response)
-        except BrainError as e:
-            logger.error(f"Model unavailable: {e.detail or e}")
-            speak(e.message)
-        except Exception as e:
-            logger.error(f"Error processing query: {e}", exc_info=True)
-            speak("I encountered an issue processing that command, Boss.")
+            # Process through Gemini LLM Brain
+            try:
+                response = brain.ask(query)
+                speak(response)
+            except BrainError as e:
+                logger.error(f"Model unavailable: {e.detail or e}")
+                speak(e.message)
+            except Exception as e:
+                logger.error(f"Error processing query: {e}", exc_info=True)
+                speak("I encountered an issue processing that command, Boss.")
+    finally:
+        stop_voice()
+        stop_perception()
 
 
 def run_wake_word_mode() -> None:
@@ -151,6 +195,8 @@ def run_wake_word_mode() -> None:
 
     listener = WakeWordListener(on_wake=on_wake)
     listener.start()
+    start_perception(brain)
+    voice = start_voice(brain)
 
     try:
         # Keep main thread alive while listener runs in background
@@ -161,6 +207,12 @@ def run_wake_word_mode() -> None:
         logger.info("Session ended by user.")
         listener.stop()
         sys.exit(0)
+    finally:
+        # Release audio and camera before the process goes down. Freeing a
+        # native handle while another thread still holds it is exactly what the
+        # previous shutdown race looked like.
+        stop_voice()
+        stop_perception()
 
 
 def run_text_mode() -> None:
@@ -180,6 +232,8 @@ def run_text_mode() -> None:
 
     set_interactive_prompting(True)
     brain = JarvisBrain()
+    start_perception(brain)
+    start_voice(brain)
 
     while True:
         try:
@@ -204,6 +258,9 @@ def run_text_mode() -> None:
         except Exception as e:
             logger.error(f"Error in text mode: {e}", exc_info=True)
             print(f"[Error]: {e}")
+
+    stop_voice()
+    stop_perception()
 
 
 def run_verification_test() -> None:

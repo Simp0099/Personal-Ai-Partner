@@ -910,7 +910,11 @@ class TestStatusEndpoint:
             behaviours={"gemini-x": reply("g"), "free-x": reply("f")},
         )
         monkeypatch.setattr(ml, "get_model_layer", lambda: layer)
-        return TestClient(api_server.app)
+        # Context manager, not a bare return: Starlette's TestClient runs an
+        # anyio portal on a daemon thread, and an unclosed client leaves that
+        # thread racing native teardown at interpreter exit.
+        with TestClient(api_server.app) as test_client:
+            yield test_client
 
     def test_status_lists_models_with_health_and_capabilities(self, client):
         body = client.get("/api/models").json()
@@ -948,7 +952,8 @@ class TestStatusEndpoint:
         from fastapi.testclient import TestClient
         import api_server
         monkeypatch.setattr(api_server, "DEBUG_ENDPOINTS", False)
-        assert TestClient(api_server.app).get("/api/models").status_code == 404
+        with TestClient(api_server.app) as inline_client:
+            assert inline_client.get("/api/models").status_code == 404
 
 
 # ============================================================================
@@ -1258,7 +1263,9 @@ class TestModelStatusCache:
     def client(self):
         from fastapi.testclient import TestClient
         import api_server
-        return TestClient(api_server.app)
+        # Closed deterministically; see the note on the other client fixture.
+        with TestClient(api_server.app) as test_client:
+            yield test_client
 
     @staticmethod
     def _probes(layer):
@@ -1432,7 +1439,8 @@ class TestModelStatusCache:
         from fastapi.testclient import TestClient
         import api_server
         monkeypatch.setattr(api_server, "DEBUG_ENDPOINTS", False)
-        assert TestClient(api_server.app).get("/api/models").status_code == 404
+        with TestClient(api_server.app) as inline_client:
+            assert inline_client.get("/api/models").status_code == 404
 
     # -- Test 6: concurrency ---------------------------------------------
 

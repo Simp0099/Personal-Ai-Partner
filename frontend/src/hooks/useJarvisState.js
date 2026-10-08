@@ -4,17 +4,22 @@ import {
   checkBackendHealth,
   clearJarvisConversation,
   getConversationId,
+  getConversationState,
+  interruptJarvis,
+  setJarvisVoice,
 } from '../utils/api'
 
 const MAX_MESSAGES = 100
-const SPEAKING_RESET_DELAY = 2000
 const HEALTH_CHECK_INTERVAL = 30000
+// Fast enough that the HUD reflects a state change as it happens, slow enough
+// that an idle tab is not polling the backend every frame.
+const STATE_POLL_INTERVAL = 400
 
 /**
  * useJarvisState — Central state management hook for JARVIS 2.0.
  *
- * Manages chat history, connection status, listening/speaking states,
- * assistant visual state, and telemetry latency.
+ * Manages chat history, connection status, and the assistant's conversational
+ * state.
  *
  * Phase 0 reliability fixes:
  * - Messages sent while a request is in flight are QUEUED and drained in order.
@@ -25,6 +30,14 @@ const HEALTH_CHECK_INTERVAL = 30000
  *   slate" actually produces a clean conversation.
  * - Every message is tagged with this tab's conversation id, so conversations
  *   cannot share backend history.
+ *
+ * Phase 4:
+ * - `assistantState` comes from the backend state machine (GET /api/state), not
+ *   from a local guess. The previous version set "speaking" the moment a reply
+ *   arrived and back to "idle" on a 2s timer, which meant the HUD claimed the
+ *   assistant was talking while it was still generating, and kept claiming it
+ *   after a barge-in had cut it off.
+ * - Voice can be switched on and off, and the user can interrupt mid-sentence.
  */
 export function useJarvisState() {
   // --- Core State ---
@@ -36,27 +49,30 @@ export function useJarvisState() {
     },
   ])
   const [isConnected, setIsConnected] = useState(false)
-  const [isListening, setIsListening] = useState(false)
-  const [isSpeaking, setIsSpeaking] = useState(false)
-  const [assistantState, setAssistantState] = useState('idle')
   const [latency, setLatency] = useState(0)
   const [isThinking, setIsThinking] = useState(false)
 
+  // Backend-authoritative conversational state.
+  const [backendState, setBackendState] = useState({
+    state: 'idle',
+    turn_id: null,
+    transcript: '',
+    voice: { running: false, wake_enabled: false },
+    webcam_running: false,
+    visual_context: { observations: [], fresh: false },
+    last_error: null,
+  })
+
   // Refs for async safety and request ordering
   const mountedRef = useRef(true)
-  const speakingTimeoutRef = useRef(null)
   const queueRef = useRef([])
   const drainingRef = useRef(false)
   const conversationIdRef = useRef(getConversationId())
 
-  // Cleanup on unmount
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
-      if (speakingTimeoutRef.current) {
-        clearTimeout(speakingTimeoutRef.current)
-      }
     }
   }, [])
 
@@ -77,6 +93,25 @@ export function useJarvisState() {
 
     return () => {
       if (intervalId) clearInterval(intervalId)
+    }
+  }, [])
+
+  // --- Conversational state polling ---
+  useEffect(() => {
+    let cancelled = false
+
+    const poll = async () => {
+      const snapshot = await getConversationState()
+      if (!cancelled && mountedRef.current) {
+        setBackendState(snapshot)
+      }
+    }
+
+    poll()
+    const id = setInterval(poll, STATE_POLL_INTERVAL)
+    return () => {
+      cancelled = true
+      clearInterval(id)
     }
   }, [])
 
@@ -103,25 +138,12 @@ export function useJarvisState() {
       setIsConnected(false)
     }
 
-    setAssistantState('speaking')
-    setIsSpeaking(true)
-
     appendMessage({
       role: 'assistant',
       content: result.response,
       isError: result.error,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     })
-
-    if (speakingTimeoutRef.current) {
-      clearTimeout(speakingTimeoutRef.current)
-    }
-    speakingTimeoutRef.current = setTimeout(() => {
-      if (mountedRef.current) {
-        setIsSpeaking(false)
-        setAssistantState('idle')
-      }
-    }, SPEAKING_RESET_DELAY)
   }, [appendMessage])
 
   /**
@@ -150,7 +172,6 @@ export function useJarvisState() {
     // Blank input is ignored client-side; the backend rejects it too.
     if (!trimmed) return
 
-    setAssistantState('listening')
     appendMessage({
       role: 'user',
       content: trimmed,
@@ -161,14 +182,19 @@ export function useJarvisState() {
     drainQueue()
   }, [appendMessage, drainQueue])
 
-  // --- Toggle Listening ---
-  const toggleListening = useCallback(() => {
-    setIsListening((prev) => {
-      const next = !prev
-      setAssistantState(next ? 'listening' : 'idle')
-      return next
-    })
+  // --- Interrupt (barge-in) ---
+  const interrupt = useCallback(async () => {
+    const result = await interruptJarvis()
+    // The state poll will pick up the new state; nothing to set locally, so the
+    // UI can never claim the assistant is still speaking after it was cut off.
+    return result
   }, [])
+
+  // --- Toggle voice input ---
+  const toggleVoice = useCallback(async () => {
+    const next = !backendState.voice?.running
+    return setJarvisVoice(next)
+  }, [backendState.voice?.running])
 
   // --- Clear Chat ---
   // Clears the backend conversation too. Previously only the local message list
@@ -186,18 +212,26 @@ export function useJarvisState() {
     ])
   }, [])
 
+  const state = backendState.state
+  const isListening = state === 'listening' || state === 'follow_up'
+  const isSpeaking = state === 'speaking'
+  const isVoiceActive = Boolean(backendState.voice?.running)
+
   return {
     // State
     messages,
     isConnected,
     isListening,
     isSpeaking,
-    assistantState,
-    latency,
     isThinking,
+    isVoiceActive,
+    assistantState: state,
+    backendState,
+    latency,
     // Actions
     sendMessage,
-    toggleListening,
+    interrupt,
+    toggleVoice,
     clearChat,
   }
 }

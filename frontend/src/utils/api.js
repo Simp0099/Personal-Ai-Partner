@@ -126,6 +126,56 @@ export async function clearJarvisConversation(conversationId = getConversationId
 }
 
 /**
+ * Fetch the authoritative conversational state.
+ *
+ * Phase 4: the backend owns the state machine, so the HUD renders this rather
+ * than inferring state from whether a reply arrived. Guessing is what made the
+ * UI look like it was speaking while the assistant was still thinking.
+ *
+ * @returns {Promise<Object>} state snapshot; `offline: true` if unreachable.
+ */
+export async function getConversationState() {
+  try {
+    const { data } = await apiClient.get('/state', { timeout: 5000 })
+    return { ...data, offline: false }
+  } catch (err) {
+    return { state: 'idle', turn_id: null, offline: true }
+  }
+}
+
+/**
+ * Interrupt the assistant mid-sentence (barge-in).
+ *
+ * Stops playback, cancels the in-flight turn and clears queued audio. Returns
+ * the state the assistant settled into.
+ */
+export async function interruptJarvis() {
+  try {
+    const { data } = await apiClient.post('/voice/interrupt', {}, { timeout: 5000 })
+    return data
+  } catch (err) {
+    console.error('[API Error] interrupt failed', err.message)
+    return { interrupted: false }
+  }
+}
+
+/**
+ * Enable or disable voice input.
+ *
+ * Turning it off releases the microphone. Text conversation is unaffected
+ * either way.
+ */
+export async function setJarvisVoice(enabled) {
+  try {
+    const { data } = await apiClient.post('/voice/start', { enabled }, { timeout: 15000 })
+    return data
+  } catch (err) {
+    console.error('[API Error] voice control failed', err.message)
+    return { status: 'unavailable', error: true }
+  }
+}
+
+/**
  * Check backend health status.
  *
  * @returns {Promise<{online: boolean, latency: number}>}

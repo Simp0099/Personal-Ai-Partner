@@ -19,9 +19,12 @@ Run with:
 """
 
 import asyncio
+import base64
+import mimetypes
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -32,6 +35,7 @@ from pydantic import BaseModel, Field
 from jarvis.brain import JarvisBrain, BrainError
 from jarvis.config import DEBUG_ENDPOINTS
 from jarvis.logger import logger
+from jarvis.providers.base import image_part
 
 app = FastAPI(title="JARVIS 2.0 API", version="2.0.0")
 
@@ -96,6 +100,14 @@ class ChatRequest(BaseModel):
         default=None,
         description="Client-scoped conversation id. Omit for a single shared session.",
     )
+    images: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional images, each either a 'data:<mime>;base64,...' URL or a "
+            "server-local file path. Images are forwarded to a vision-capable "
+            "model for this turn and are not persisted."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
@@ -103,6 +115,22 @@ class ChatResponse(BaseModel):
     latency: int
     error: bool = False
     conversation_id: str = "default"
+    #: Conversational state at the time the reply was produced. Lets the client
+    #: tell a live reply from one that arrived after the user interrupted.
+    state: Optional[str] = None
+    turn_id: Optional[str] = None
+
+
+class VoiceControl(BaseModel):
+    """Enable or disable voice input."""
+
+    enabled: bool = True
+
+
+class InterruptRequest(BaseModel):
+    """Barge-in request. Carries the turn being abandoned, if the client knows it."""
+
+    turn_id: Optional[str] = None
 
 
 class ClearRequest(BaseModel):
@@ -244,30 +272,195 @@ async def model_status():
     return await asyncio.to_thread(_get_model_status, time.monotonic())
 
 
+def _decode_images(raw: Optional[List[str]]) -> List[dict]:
+    """Turn request image references into provider-neutral image parts.
+
+    Accepts data URLs and server-local paths. Decoding happens here so the Brain
+    never deals with transport formats, and the resulting bytes are held only
+    for the turn -- nothing about an image is written to disk or to memory.
+    """
+    parts = []
+    for item in raw or []:
+        try:
+            if item.startswith("data:"):
+                header, _, payload = item.partition(",")
+                mime = header[5:].split(";")[0] or "image/png"
+                parts.append(image_part(base64.b64decode(payload), mime))
+            else:
+                path = Path(item).expanduser()
+                mime = mimetypes.guess_type(str(path))[0] or "image/png"
+                parts.append(image_part(path.read_bytes(), mime))
+        except (ValueError, OSError) as e:
+            # A bad reference is a client error, not a reason to answer as if
+            # the image had been seen.
+            raise ValueError(f"Could not read image '{item[:40]}': {e}") from e
+    return parts
+
+
+@app.get("/api/vision")
+async def vision_status():
+    """Vision and webcam-perception status.
+
+    Read-only on purpose. It reports whether the camera is *enabled by config*,
+    *actually open*, and what it has seen so far — so the state of the camera is
+    never a guess. It contains no image data, no frames and no credentials, and
+    it will never start the camera: opening a device is a user decision made in
+    config.yaml.
+    """
+    from jarvis.config import VISION_ENABLED, WEBCAM_ENABLED
+    from jarvis.webcam import get_webcam_perception
+    from jarvis.vision import get_visual_context
+
+    perception = get_webcam_perception()
+    return {
+        "vision_enabled": VISION_ENABLED,
+        "webcam_enabled_by_config": WEBCAM_ENABLED,
+        "webcam": perception.status() if perception else {
+            "enabled": False,
+            "running": False,
+            "camera_available": False,
+            "note": "Webcam perception is disabled; no camera has been opened.",
+        },
+        "visual_context": get_visual_context().status(),
+    }
+
+
+@app.get("/api/state")
+async def conversation_state():
+    """Authoritative conversational state.
+
+    The HUD renders this and nothing else. It deliberately does not let the
+    frontend infer state from timing or from whether a reply arrived: a client
+    that guesses "speaking" when a reply is slow ends up talking over the
+    assistant, which is precisely what Phase 4 exists to prevent.
+
+    Read-only. Nothing here starts the microphone.
+    """
+    from jarvis.vision import get_visual_context
+    from jarvis.webcam import get_webcam_perception
+    from jarvis.voice_loop import get_voice_loop
+
+    loop = get_voice_loop()
+    machine = loop.machine if loop is not None else _state_machine()
+
+    return {
+        **machine.snapshot(),
+        "voice": loop.status() if loop is not None else {
+            "running": False,
+            "wake_enabled": False,
+            "note": "Voice input is not running; text conversation is unaffected.",
+        },
+        "webcam_running": bool(get_webcam_perception() and get_webcam_perception().is_running()),
+        "visual_context": get_visual_context().status(),
+    }
+
+
+_shared_machine_lock = threading.Lock()
+_shared_machine = None
+
+
+def _state_machine():
+    """The machine the API reports, whether or not voice is running.
+
+    Text conversation still moves the state machine, so the HUD shows a coherent
+    picture even with the microphone switched off.
+    """
+    global _shared_machine
+    with _shared_machine_lock:
+        if _shared_machine is None:
+            from jarvis.conversation import ConversationMachine
+            _shared_machine = ConversationMachine()
+        return _shared_machine
+
+
+@app.post("/api/voice/start")
+async def voice_start(request: VoiceControl):
+    """Start or stop voice input. Reports honestly when audio is unavailable."""
+    from jarvis.voice_loop import get_voice_loop, start_voice_loop, stop_voice_loop
+
+    if not request.enabled:
+        stop_voice_loop()
+        return {"status": "stopped", "voice": get_voice_loop()}
+
+    brain = get_brain("default")
+    loop = start_voice_loop(brain, force=True)
+    if loop is None:
+        # start_voice_loop only returns None on failure when forced, so this is a
+        # genuine "could not start" and must say so rather than looking idle.
+        previous = get_voice_loop()
+        return {
+            "status": "unavailable",
+            "error": True,
+            "detail": (previous.last_error if previous else "voice input unavailable"),
+            "note": "Text conversation still works.",
+        }
+    return {"status": "running", "voice": loop.status()}
+
+
+@app.post("/api/voice/interrupt")
+async def voice_interrupt(request: Optional[InterruptRequest] = None):
+    """Stop the assistant speaking now and start listening to the user."""
+    from jarvis.voice_loop import get_voice_loop
+
+    loop = get_voice_loop()
+    if loop is None or not loop.is_running():
+        return {"status": "idle", "interrupted": False,
+                "note": "Voice input is not running."}
+    loop.interrupt()
+    return {
+        "status": loop.machine.state.value,
+        "interrupted": True,
+        "turn_id": loop.machine.turn.id if loop.machine.turn else None,
+    }
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Process a chat message through the JARVIS brain.
+    """Process a chat message, optionally with images, through the JARVIS brain.
 
     The message is forwarded to the brain exactly as received. Blank input is
-    rejected with 400 rather than being answered by the model.
+    rejected with 400 unless images are attached, since a picture alone is a
+    valid turn.
     """
     start = time.time()
 
-    if request.message is None or not request.message.strip():
+    has_text = request.message is not None and request.message.strip()
+    if not has_text and not request.images:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    try:
+        images = _decode_images(request.images)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     conversation_id = request.conversation_id or "default"
     brain = get_brain(conversation_id)
 
+    # Typing during a spoken reply is also an interruption. The user does not
+    # have to wait for a voice command to get the floor back.
+    from jarvis.voice_loop import get_voice_loop
+    loop = get_voice_loop()
+    machine = loop.machine if loop is not None else _state_machine()
+    if loop is not None and loop.is_running() and machine.state.value in ("speaking", "thinking"):
+        loop.interrupt()
+
+    turn = machine.begin_turn(request.message or "")
+    machine.mark("first_token")
+
     try:
         # brain.ask is blocking (network + tools); keep the event loop free.
-        response = await asyncio.to_thread(brain.ask, request.message.strip())
+        response = await asyncio.to_thread(
+            brain.ask, (request.message or "").strip(), images
+        )
         latency = int((time.time() - start) * 1000)
+        machine.end_turn(turn.id)
         return ChatResponse(
             response=response,
             latency=latency,
             error=False,
             conversation_id=conversation_id,
+            state=machine.state.value,
+            turn_id=turn.id,
         )
     except ValueError as e:
         # Blank/invalid input — a client error, not a backend failure.
@@ -277,20 +470,26 @@ async def chat(request: ChatRequest):
         # error text as if the assistant had said it.
         logger.error(f"Brain error (session={conversation_id}): {e.detail or e}")
         latency = int((time.time() - start) * 1000)
+        machine.end_turn(turn.id)
         return ChatResponse(
             response=e.message,
             latency=latency,
             error=True,
             conversation_id=conversation_id,
+            state=machine.state.value,
+            turn_id=turn.id,
         )
     except Exception as e:  # noqa: BLE001
         logger.error(f"Chat error (session={conversation_id}): {e}", exc_info=True)
         latency = int((time.time() - start) * 1000)
+        machine.end_turn(turn.id)
         return ChatResponse(
             response="The assistant hit an unexpected internal error.",
             latency=latency,
             error=True,
             conversation_id=conversation_id,
+            state=machine.state.value,
+            turn_id=turn.id,
         )
 
 

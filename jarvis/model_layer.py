@@ -132,11 +132,13 @@ class ModelLayer:
         *,
         conversation_tokens: int = 0,
         tools_available: bool = True,
+        vision_required: bool = False,
     ) -> Classification:
         return self.router.classify_request(
             user_message,
             conversation_tokens=conversation_tokens,
             tools_available=tools_available,
+            vision_required=vision_required,
         )
 
     def plan(

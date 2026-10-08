@@ -169,7 +169,11 @@ _UPDATE_INTENT = (
 )
 
 
-def memory_posture(user_text: str, subjects: Optional[List[str]] = None) -> str:
+def memory_posture(
+    user_text: str,
+    subjects: Optional[List[str]] = None,
+    has_images: bool = False,
+) -> str:
     """Additional directive for turns that carry an explicit memory intent.
 
     Detection is keyword-based and advisory: it changes how the turn is
@@ -181,6 +185,8 @@ def memory_posture(user_text: str, subjects: Optional[List[str]] = None) -> str:
         subjects: Existing subject keys. Supplied because supersession only
             happens when the writer reuses a key, and a model that invents a
             fresh one silently leaves two contradicting memories active.
+        has_images: Whether this turn carries an image, which changes what
+            "remember this" should be taken to mean.
     """
     lowered = (user_text or "").lower()
     tokens = tokenize(lowered)
@@ -200,17 +206,98 @@ def memory_posture(user_text: str, subjects: Optional[List[str]] = None) -> str:
     if forget:
         return _FORGET_INTENT
 
-    if remember or (update and tokens):
+    if has_images and remember:
+        intent = _VISUAL_MEMORY_INTENT
+    elif remember or (update and tokens):
         intent = _REMEMBER_INTENT if remember else _UPDATE_INTENT
-        if subjects:
-            keys = ", ".join(subjects)
-            intent += (
-                f"\n- These subject keys already exist: {keys}. If what the user "
-                "is saying corrects one of them, reuse that exact key so it is "
-                "replaced rather than stored alongside a contradiction."
-            )
-        return intent
-    return ""
+    else:
+        return ""
+
+    # Applies to every write intent, visual included. Without it a model asked to
+    # remember something it can see invents a fresh subject key and the new fact
+    # lands *beside* the old one instead of replacing it.
+    if subjects:
+        keys = ", ".join(subjects)
+        intent += (
+            f"\n- These subject keys already exist: {keys}. If what the user "
+            "is saying corrects one of them, reuse that exact key so it is "
+            "replaced rather than stored alongside a contradiction."
+        )
+    return intent
+
+
+def vision_directive(image_count: int) -> str:
+    """Posture for a turn that carries images.
+
+    Two things matter here and both are cheap: stay grounded in what the image
+    actually shows, and treat the image as temporary context rather than
+    something to file away automatically.
+    """
+    plural = "images" if image_count != 1 else "image"
+    return "\n".join([
+        f"## Visual Input",
+        f"- The user attached {image_count} {plural}. Look at the image before "
+        "answering, and reason from what is actually visible in it.",
+        "- Stay grounded. Do not describe text, controls, objects, or values that "
+        "you cannot read in the image, and do not guess at them. If something "
+        "cannot be determined from the image, say exactly that instead of "
+        "filling the gap.",
+        "- When the image contradicts a stored memory, answer from what the image "
+        "actually shows, say plainly that memory says something different, and "
+        "ask whether to update it. Do not quietly answer from the older memory, "
+        "and do not silently overwrite it either.",
+        "- Never claim to have seen an image you were not given, and never imply "
+        "an image was processed when it was not.",
+        "- The image is context for this conversation, not something to store. "
+        "Store only what the user explicitly asks you to remember, and store the "
+        "fact rather than the picture.",
+    ])
+
+
+def perception_directive() -> str:
+    """Posture for a quiet webcam-perception turn.
+
+    Replaces the ordinary turn context: a camera analysis must not read the
+    user's conversation, and the answer is a note for the visual context rather
+    than a reply to anyone. Everything that keeps perception honest lives here —
+    report what matters, keep observation and inference apart, and never turn a
+    person into a psychological profile.
+    """
+    return "\n".join([
+        "## Webcam Perception",
+        "- This is an automatic observation of the user's camera. Nothing was "
+        "asked of you and no one is waiting for a reply. Do not greet, address "
+        "the user, or ask a question: report what the frame shows in the short "
+        "form below, because this is filed as visual context and used later "
+        "only if the user asks what is visible.",
+        "- Report only what changed and what matters: a person arriving or "
+        "leaving, an object appearing or going, a workstation change. Do not "
+        "catalogue the room — no walls, floors, furniture inventory or lighting "
+        "description unless they changed.",
+        "- Keep the three kinds of claim apart. 'observed' is only what is "
+        "physically visible in the frame. 'inferred' is a conclusion drawn from "
+        "it, and must read as one. 'unclear' is something present but not "
+        "reliably readable. One line per point, each prefixed accordingly.",
+        "- Refuse to profile the person. No identity, no age, gender, race or "
+        "other attribute, no emotion, mood, health or diagnosis, no intentions "
+        "or thoughts. Describe a person only as physically present, positioned, "
+        "and doing what is visible.",
+        "- Never repeat or store any text that looks like a password, token, "
+        "key or other credential, even when it is legible.",
+        "- If the frame shows nothing worth reporting, say so in a few words "
+        "rather than inventing something.",
+    ])
+
+
+_VISUAL_MEMORY_INTENT = (
+    "The user has asked you to remember something they showed you. Save the "
+    "durable fact, not the image: what it is, what it shows, what was decided "
+    "or configured, and the project it belongs to. Never store raw image data, "
+    "and never store credentials, tokens, passwords, keys, or personal "
+    "identifiers that happen to be visible. Mark anything you are inferring "
+    "rather than reading as uncertain, and prefer waiting for the user to "
+    "confirm before storing a guess."
+)
 
 
 def memory_context(facts: List, greeting_name: str) -> str:

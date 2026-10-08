@@ -14,6 +14,7 @@ API keys are always read from the environment and never stored here.
 
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 import ssl
@@ -52,6 +53,25 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:  # noqa: BLE001 - certifi absent: fall back to system store
         return ssl.create_default_context()
+
+
+def _openai_user_parts(text: Optional[str], images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Render a text+image turn as OpenAI content parts.
+
+    Images travel as inline base64 data URLs, which is what the Chat Completions
+    API expects for uploaded pictures. Text comes first so the model reads the
+    question before the evidence; an image-only turn sends no text part at all.
+    """
+    parts: List[Dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for img in images:
+        encoded = base64.b64encode(img["data"]).decode("ascii")
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img['mime']};base64,{encoded}"},
+        })
+    return parts
 
 
 class OpenAICompatSession(ChatSession):
@@ -119,7 +139,13 @@ class OpenAICompatSession(ChatSession):
 
         else:
             content = msg.get("content")
-            if content:
+            images = msg.get("images") or []
+            if images:
+                self._messages.append({
+                    "role": "user",
+                    "content": _openai_user_parts(content, images),
+                })
+            elif content:
                 self._messages.append({"role": "user", "content": content})
 
     # -- transport ---------------------------------------------------------
@@ -127,8 +153,12 @@ class OpenAICompatSession(ChatSession):
     def send_message(self, payload: Dict[str, Any]) -> ModelResponse:
         kind = payload.get("kind")
         if kind == "user":
-            # The user's text is appended verbatim.
-            self._append({"role": "user", "content": payload["text"]})
+            # The user's text is appended verbatim; images ride alongside it.
+            self._append({
+                "role": "user",
+                "content": payload["text"],
+                "images": payload.get("images"),
+            })
         elif kind == "tool_results":
             self._append({"role": "tool", "results": payload.get("results", [])})
         else:

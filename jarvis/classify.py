@@ -39,6 +39,8 @@ class Classification:
     #: Secondary types also plausibly apply, with lower weight.
     secondary: List[TaskType] = field(default_factory=list)
     tool_required: bool = False
+    #: The turn carries an image, so only a vision-capable model can serve it.
+    vision_required: bool = False
     estimated_tokens: int = 0
     #: Signals that fired, for diagnostics and debugging.
     signals: List[str] = field(default_factory=list)
@@ -125,6 +127,7 @@ def classify(
     tools_available: bool = True,
     conversation_tokens: int = 0,
     context_threshold: int = 100_000,
+    vision_required: bool = False,
 ) -> Classification:
     """Classify a user request.
 
@@ -136,13 +139,16 @@ def classify(
         conversation_tokens: Existing conversation size, used to detect
             long-context work.
         context_threshold: Token count above which a task counts as long-context.
+        vision_required: The turn carries at least one image. Set by the Brain
+            from the actual attachments rather than inferred from keywords,
+            because only the attachments say what was really sent.
 
     Returns:
         A :class:`Classification`.
     """
     text = (user_message or "").strip()
     lowered = text.lower()
-    result = Classification()
+    result = Classification(vision_required=bool(vision_required))
 
     if not text:
         return result

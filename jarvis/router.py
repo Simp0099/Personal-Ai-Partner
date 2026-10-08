@@ -133,6 +133,7 @@ class ModelRouter:
         *,
         conversation_tokens: int = 0,
         tools_available: bool = True,
+        vision_required: bool = False,
     ) -> Classification:
         """Classify a request, resolving the long-context threshold from config."""
         smallest_window = min(
@@ -143,6 +144,7 @@ class ModelRouter:
             tools_available=tools_available,
             conversation_tokens=conversation_tokens,
             context_threshold=max(50_000, smallest_window // 2),
+            vision_required=vision_required,
         )
 
     def select(
@@ -206,6 +208,11 @@ class ModelRouter:
             if classification.tool_required and not spec.supports("tool_calling"):
                 # Hard requirement: a tool-required request must never reach a
                 # model that cannot execute tools.
+                continue
+            if classification.vision_required and not spec.supports("vision"):
+                # Hard requirement: sending an image to a text-only model would
+                # either be rejected or silently answered from the text alone,
+                # which is worse than an honest failure.
                 continue
             if not self._meets_task_requirements(spec, classification):
                 continue

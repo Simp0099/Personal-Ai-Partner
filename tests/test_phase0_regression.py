@@ -125,11 +125,20 @@ class _Sent:
 
 @pytest.fixture()
 def client():
-    """A TestClient against the real FastAPI app with a clean session registry."""
+    """A TestClient against the real FastAPI app with a clean session registry.
+
+    Used as a context manager on purpose. Starlette's ``TestClient`` runs an
+    ``anyio`` blocking portal on a daemon thread; yielding the client without
+    closing it leaves that thread alive, and the leftover threads race the
+    interpreter's native teardown at exit (the intermittent
+    ``libc++abi ... recursive_mutex`` abort). ``with`` runs ``__exit__``, which
+    shuts the portal down and joins the thread deterministically.
+    """
     from fastapi.testclient import TestClient
     import api_server
     api_server.clear_all_brains()
-    yield TestClient(api_server.app)
+    with TestClient(api_server.app) as test_client:
+        yield test_client
     api_server.clear_all_brains()
 
 

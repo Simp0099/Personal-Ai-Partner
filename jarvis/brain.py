@@ -45,6 +45,7 @@ from jarvis.tools import (
 )
 from jarvis import behavior
 from jarvis import memory
+from jarvis import vision
 from jarvis.logger import logger, StatusIndicator
 from jarvis.model_layer import (
     ModelLayer,
@@ -107,6 +108,7 @@ def _build_context_block(
     message: str,
     classification: Any,
     history: List[Dict[str, Any]],
+    images: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the per-turn context: relevant memory, then behavioral posture.
 
@@ -117,6 +119,7 @@ def _build_context_block(
         message: The user's message this turn.
         classification: The Brain's read of the request, for the directive.
         history: This conversation's earlier turns.
+        images: Images attached to this turn, if any.
 
     Returns:
         Prompt text, or an empty string when there is nothing to add.
@@ -129,7 +132,11 @@ def _build_context_block(
         recent = " ".join(
             str(m.get("content") or "") for m in history[-4:] if m.get("role") == "user"
         )
-        facts = memory.recall_relevant(get_memory_conn(), f"{message} {recent}")
+        # The connection is shared with the voice turn thread, so every use is
+        # serialised. Without this, a voice turn races a typed message and
+        # memory retrieval fails for whichever one loses.
+        with memory.db_locked():
+            facts = memory.recall_relevant(get_memory_conn(), f"{message} {recent}")
     except Exception as e:  # noqa: BLE001 - memory must never break a turn
         logger.warning(f"Memory retrieval skipped: {e}")
         facts = []
@@ -142,12 +149,13 @@ def _build_context_block(
     subjects: List[str] = []
     if behavior.memory_posture(message):
         try:
-            subjects = memory.active_subjects(get_memory_conn())
+            with memory.db_locked():
+                subjects = memory.active_subjects(get_memory_conn())
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Subject listing skipped: {e}")
 
     posture = behavior.memory_context(facts, GREETING_NAME)
-    intent = behavior.memory_posture(message, subjects)
+    intent = behavior.memory_posture(message, subjects, has_images=bool(images))
     if intent:
         posture = f"{posture}\n- {intent}" if posture else f"- {intent}"
     if posture:
@@ -159,6 +167,13 @@ def _build_context_block(
     )
     if directive:
         parts.append("\n\n## This turn\n" + directive)
+
+    if images:
+        parts.append("\n\n" + behavior.vision_directive(len(images)))
+
+    # Short-lived camera view, when there is a fresh one. Empty otherwise, so an
+    # idle camera costs nothing on unrelated turns.
+    parts.append(vision.format_context_block())
 
     return "".join(parts)
 
@@ -349,14 +364,18 @@ def save_memory(
     if not (fact or "").strip():
         return "Nothing to save -- the fact was empty."
     try:
-        conn = get_memory_conn()
-        if not memory.remember(
-            conn, fact, category, subject=subject or None, source=source
-        ):
-            # Never promise persistence that did not happen.
-            return "I couldn't save that to memory. It has not been stored."
+        with memory.db_locked():
+            conn = get_memory_conn()
+            if memory.contains_secret(fact):
+                return ("I didn't store that: it looks like it contains a credential "
+                        "(a key, token, or password). Nothing has been saved.")
+            if not memory.remember(
+                conn, fact, category, subject=subject or None, source=source
+            ):
+                # Never promise persistence that did not happen.
+                return "I couldn't save that to memory. It has not been stored."
 
-        count = memory.get_memory_count(conn)
+            count = memory.get_memory_count(conn)
         StatusIndicator.memory(f"Saved fact #{count}: '{fact}'")
         superseded = ""
         if subject:
@@ -382,8 +401,9 @@ def forget_memory(query: str) -> str:
     if not (query or "").strip():
         return "Nothing to forget -- no description was given."
     try:
-        conn = get_memory_conn()
-        forgotten = memory.forget_matching(conn, query)
+        with memory.db_locked():
+            conn = get_memory_conn()
+            forgotten = memory.forget_matching(conn, query)
         if forgotten:
             for fact in forgotten:
                 StatusIndicator.memory(f"Forgotten: '{fact}'")
@@ -406,10 +426,15 @@ def recall_memories(query: str = "") -> str:
         A formatted list of recalled facts, or a message if none match.
     """
     try:
-        conn = get_memory_conn()
+        with memory.db_locked():
+            conn = get_memory_conn()
+
+            if query:
+                facts = memory.search_memories(conn, query)
+            else:
+                facts = memory.recall_all(conn)
 
         if query:
-            facts = memory.search_memories(conn, query)
             if facts:
                 lines = [f"Here's what I remember about '{query}':"]
                 for i, fact in enumerate(facts, 1):
@@ -417,7 +442,6 @@ def recall_memories(query: str = "") -> str:
                 return "\n".join(lines)
             return f"Nothing in memory matches '{query}'."
 
-        facts = memory.recall_all(conn)
         if facts:
             lines = ["Here's everything I currently remember:"]
             for i, fact in enumerate(facts, 1):
@@ -496,6 +520,11 @@ class JarvisBrain:
         #: Per-turn context: relevant memory + behavioral layer. Recomputed each
         #: turn, because relevance depends on what is being asked.
         self._turn_context = ""
+        #: True while an ephemeral (perception) turn is in flight. Such a turn
+        #: gets no tools at all: a camera frame must never be able to call
+        #: save_memory, which is how "webcam observation" would become permanent
+        #: memory.
+        self._ephemeral = False
         self._message_count = 0
         # One in-flight request per conversation, so overlapping requests cannot
         # interleave and reorder the user's messages.
@@ -550,7 +579,9 @@ class JarvisBrain:
         session = provider.open_session(
             model_id=spec.model_id,
             system_prompt=system_prompt,
-            tools=GEMINI_TOOLS,
+            # No tools on a perception turn. The webcam is an observer, not an
+            # actor: it may not write memory, send mail, or open a browser.
+            tools=[] if self._ephemeral else GEMINI_TOOLS,
             history=list(history or []),
             **self.layer.options_for(spec),
         )
@@ -583,6 +614,7 @@ class JarvisBrain:
         self._session = None
         self._history = []
         self._turn_context = ""
+        self._ephemeral = False
         self._message_count = 0
 
     def _record(self, *messages: Dict[str, Any]) -> None:
@@ -592,6 +624,14 @@ class JarvisBrain:
         cap = MAX_HISTORY_MESSAGES * 2
         if len(self._history) > cap:
             self._history = self._history[-cap:]
+
+    def _history_has_images(self) -> bool:
+        """Whether any earlier turn in this conversation carried an image.
+
+        Only the tail of the history is ever replayed, so only the tail needs
+        checking -- but the tail is exactly what would be sent.
+        """
+        return any(turn.get("images") for turn in self._history[-MAX_HISTORY_MESSAGES * 2:])
 
     def _trim_history(self) -> None:
         """Trim history to a recent window, keeping the conversation usable.
@@ -644,50 +684,108 @@ class JarvisBrain:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def ask(self, user_text: str) -> str:
-        """Process one user message.
+    def ask(
+        self,
+        user_text: str,
+        images: Optional[List[Dict[str, Any]]] = None,
+        *,
+        ephemeral: bool = False,
+    ) -> str:
+        """Process one user message, optionally with images.
 
         The user's text is forwarded verbatim as the latest user turn. Nothing in
-        this method rewrites, truncates, or replaces it.
+        this method rewrites, truncates, or replaces it. Images ride alongside
+        the text in the provider-neutral format and are rendered by each
+        provider adapter.
 
         Args:
-            user_text: The user's input message.
+            user_text: The user's input message. May be empty when images are
+                attached.
+            images: Optional provider-neutral image parts from
+                :func:`jarvis.providers.base.image_part`.
+            ephemeral: Run this turn outside the conversation. Used by webcam
+                perception: the model sees the frame and answers, but the turn
+                is not recorded in history and does not carry the user's
+                conversation, so camera perception can never appear as something
+                the user said, or as a turn they now have to scroll past.
 
         Returns:
             The model's final text response after any tool calls.
 
         Raises:
-            ValueError: If `user_text` is empty.
-            BrainError: If no configured model can serve the request.
+            ValueError: If both `user_text` and `images` are empty.
+            BrainError: If no configured model can serve the request, including
+                when images are attached but no vision-capable model exists.
         """
+        images = images or []
         if user_text is None or not user_text.strip():
-            raise ValueError("ask() requires a non-empty user message.")
+            if not images:
+                raise ValueError("ask() requires a non-empty message or an image.")
+            # An image-only turn is legitimate: the picture is the message.
+            user_text = ""
 
         message = user_text.strip()
 
-        if DEBUG_INPUT:
-            logger.info(f"[INPUT] session={self.conversation_id} message={message!r}")
+        if DEBUG_INPUT and not ephemeral:
+            logger.info(
+                f"[INPUT] session={self.conversation_id} message={message!r} "
+                f"images={len(images)}"
+            )
 
         # Serialize turns so rapid messages cannot interleave or reorder.
         with self._lock:
-            return self._ask_locked(message)
+            self._ephemeral = ephemeral
+            # An ephemeral turn borrows these two flags for its duration and
+            # hands them back: the conversation's own turn context must not be
+            # left holding a camera directive for the next history rebuild.
+            saved_context = self._turn_context
+            try:
+                return self._ask_locked(message, images, ephemeral=ephemeral)
+            finally:
+                self._ephemeral = False
+                self._turn_context = saved_context
 
-    def _ask_locked(self, message: str) -> str:
-        StatusIndicator.thinking()
+    def _ask_locked(
+        self,
+        message: str,
+        images: Optional[List[Dict[str, Any]]] = None,
+        *,
+        ephemeral: bool = False,
+    ) -> str:
+        images = images or []
+        if not ephemeral:
+            StatusIndicator.thinking()
 
         self._trim_history()
 
         classification = self.layer.classify(
             message,
             conversation_tokens=estimate_tokens(self._history),
-            tools_available=bool(GEMINI_TOOLS),
+            tools_available=bool(GEMINI_TOOLS) and not ephemeral,
+            # Vision is required if *this* turn carries an image OR an earlier
+            # turn in the conversation did. History is replayed to whichever
+            # model serves this turn, so a text-only model would be handed the
+            # conversation's images too -- which providers reject outright
+            # ("No endpoints found that support image input"), failing the turn
+            # with a non-retryable error instead of falling back.
+            vision_required=bool(images) or self._history_has_images(),
         )
-        context_tokens = estimate_tokens(self._history) + estimate_tokens([{"content": message}])
+        context_tokens = estimate_tokens(self._history) + estimate_tokens([
+            {"content": message, "images": images}
+        ])
 
         # Phase 2: relevant long-term memory plus this turn's behavioral posture.
         # Deterministic, no extra model call -- the classification already
         # exists for model selection.
-        self._turn_context = _build_context_block(message, classification, self._history)
+        #
+        # An ephemeral turn (webcam perception) gets neither: it must not read the
+        # user's private conversation to describe a room, and must not carry the
+        # user's memory into an image analysis.
+        self._turn_context = (
+            behavior.perception_directive()
+            if ephemeral
+            else _build_context_block(message, classification, self._history, images)
+        )
 
         ranked = self.layer.plan(classification, context_tokens=context_tokens)
 
@@ -700,11 +798,12 @@ class JarvisBrain:
 
         if not ranked:
             raise BrainError(
-                _NO_MODEL_MESSAGE,
+                _NO_VISION_MESSAGE if images else _NO_MODEL_MESSAGE,
                 detail=(
                     "no eligible model. "
                     f"task={classification.task_type.value} "
                     f"tool_required={classification.tool_required} "
+                    f"vision_required={classification.vision_required} "
                     f"enabled={[s.key for s in self.layer.registry.enabled()]}"
                 ),
             )
@@ -724,8 +823,14 @@ class JarvisBrain:
             started = _now()
 
             try:
-                session = self._create_chat(spec, history=self._history)
-                response = session.send_message({"kind": "user", "text": message})
+                # An ephemeral turn starts a clean session: the user's history
+                # has no business in a camera analysis, and perception is not a
+                # turn of this conversation.
+                session = self._create_chat(spec, history=[] if ephemeral else self._history)
+                payload = {"kind": "user", "text": message}
+                if images:
+                    payload["images"] = images
+                response = session.send_message(payload)
             except ProviderError as e:
                 latency = _now() - started
                 self.layer.record_failure(spec, e, latency)
@@ -747,11 +852,6 @@ class JarvisBrain:
                 logger.info(f"[MODEL OUTPUT] session={self.conversation_id} model={spec.key} "
                             f"latency={latency:.2f}s")
 
-            # Duplicate-execution safety spans attempts (a side effect must not
-            # replay across a model switch), but the failure note must describe
-            # only the attempt that actually produced this reply.
-            attempt_results: List[str] = []
-
             try:
                 reply = self._run_tool_loop(
                     session=session,
@@ -759,7 +859,6 @@ class JarvisBrain:
                     response=response,
                     turn_messages=turn_messages,
                     executed_this_turn=executed_this_turn,
-                    attempt_results=attempt_results,
                 )
             except ProviderError as e:
                 self.layer.record_failure(spec, e)
@@ -769,11 +868,18 @@ class JarvisBrain:
                     raise BrainError(_friendly_error_message(e), detail="; ".join(failures)) from e
                 continue
 
-            # Phase 2: a turn whose tools all failed must not read as a success.
-            reply += behavior.tool_failure_note(attempt_results)
-
             # Commit the turn: user message plus everything the model produced.
-            self._record({"role": "user", "content": message}, *turn_messages)
+            # Images stay with their turn so a mid-conversation model switch
+            # still has the visual context the discussion referred to. A
+            # text-only turn records exactly what it always did.
+            if ephemeral:
+                # Perception turns update visual context, not conversation.
+                # Nothing is recorded, so nothing to speak about later.
+                return reply
+            user_turn: Dict[str, Any] = {"role": "user", "content": message}
+            if images:
+                user_turn["images"] = images
+            self._record(user_turn, *turn_messages)
             return reply
 
         raise BrainError(_friendly_error_message_from_failures(failures), detail="; ".join(failures))
@@ -796,7 +902,6 @@ class JarvisBrain:
         response: ModelResponse,
         turn_messages: List[Dict[str, Any]],
         executed_this_turn: Dict[str, str],
-        attempt_results: Optional[List[str]] = None,
     ) -> str:
         """Serve tool requests until the model returns text.
 
@@ -804,6 +909,10 @@ class JarvisBrain:
         they are committed to history even if the turn ultimately fails -- the
         conversation must not lose the fact that a tool ran.
         """
+        # What this attempt actually executed, so an empty final model message
+        # can report the tool output instead of pretending nothing happened.
+        executed: List[Tuple[str, str]] = []
+
         for round_index in range(MAX_TOOL_ROUNDS):
             if not response.has_tool_calls:
                 break
@@ -840,8 +949,7 @@ class JarvisBrain:
                     executed_this_turn[cache_key] = result
 
                 StatusIndicator.tool_result(tool_name, result)
-                if attempt_results is not None:
-                    attempt_results.append(result)
+                executed.append((tool_name, result))
 
                 assistant_calls.append({
                     "id": call.id, "name": tool_name, "arguments": tool_args,
@@ -857,7 +965,16 @@ class JarvisBrain:
 
             response = session.send_message({"kind": "tool_results", "results": results})
 
-        reply = (response.text or "").strip() or "Standing by, Boss."
+        reply = (response.text or "").strip()
+        if reply:
+            reply += behavior.tool_failure_note([r for _, r in executed])
+        elif executed:
+            # The model produced nothing after the tools ran. That is not the
+            # same as "nothing happened", so report what the tools returned.
+            reply = _report_executed(executed)
+        else:
+            reply = "Standing by, Boss."
+
         turn_messages.append({"role": "assistant", "content": reply})
         return reply
 
@@ -865,6 +982,23 @@ class JarvisBrain:
 # ============================================================================
 # Helpers
 # ============================================================================
+
+def _report_executed(executed: List[Tuple[str, str]]) -> str:
+    """Truthful reply when the model returned no text after tools ran.
+
+    Surfacing the tool's own output is the honest minimum: the action did
+    happen, and the user needs its result. Failures stay labelled as failures so
+    this can never read as success.
+    """
+    lines = []
+    for name, result in executed:
+        text = str(result or "").strip() or "(no output)"
+        if text.startswith("Error"):
+            lines.append(f"- {name} did not complete: {text}")
+        else:
+            lines.append(f"- {name}: {text}")
+    return "\n".join(lines)
+
 
 def _tool_cache_key(name: str, args: Dict[str, Any]) -> str:
     """Stable key identifying a tool invocation within one user turn.
@@ -925,6 +1059,14 @@ def _friendly_error_message_from_failures(failures: List[str]) -> str:
 
 _NO_MODEL_MESSAGE = (
     "No AI model is currently available to handle that request. Please try again shortly."
+)
+
+#: Said plainly rather than answering as though the image had been seen. Silently
+#: dropping the picture is the one outcome that must never happen.
+_NO_VISION_MESSAGE = (
+    "I can't look at images right now — no available model supports vision. "
+    "The image has not been processed. Please try again once a vision-capable "
+    "model is available, or describe what you need from it."
 )
 
 

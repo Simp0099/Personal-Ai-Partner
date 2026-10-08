@@ -7,7 +7,30 @@ import { Wifi, WifiOff, Mic, MicOff, Volume2, VolumeX, Activity } from 'lucide-r
  *
  * Hides latency on mobile via CSS. Compact on small screens.
  */
-export default function StatusBar({ isConnected, isListening, isSpeaking, latency }) {
+/**
+ * Phase 4: `assistantState` is the backend's state, shown verbatim. The label is
+ * no longer derived from whether a reply happened to arrive, because that is
+ * how a HUD ends up claiming the assistant is talking when it has been cut off.
+ */
+const STATE_LABELS = {
+  idle: 'Standby',
+  listening: 'Listening',
+  transcribing: 'Hearing you',
+  thinking: 'Thinking',
+  speaking: 'Speaking',
+  follow_up: 'Go ahead',
+  interrupted: 'Interrupted',
+  error: 'Error',
+}
+
+export default function StatusBar({
+  isConnected,
+  isListening,
+  isSpeaking,
+  isVoiceActive = false,
+  assistantState = 'idle',
+  latency,
+}) {
   const [displayLatency, setDisplayLatency] = useState(latency ?? 0)
 
   useEffect(() => {

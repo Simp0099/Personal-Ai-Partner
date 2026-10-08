@@ -263,9 +263,49 @@ def new_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:16]}"
 
 
-def user_message(text: str) -> Dict[str, Any]:
-    """A user turn. The user's text is carried verbatim."""
-    return {"role": "user", "content": text}
+#: Image types accepted for visual input. Explicit allowlist: an unknown type
+#: is more likely to be a mistake or an attack than a real screenshot.
+IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+
+#: Per-image cap. Provider limits are lower still (OpenAI ~20MB total), but
+#: refusing early keeps a malformed request from becoming a large upload.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+#: Rough token cost of one image, used only for context-window routing. A
+#: vision model charges far more than a few text tokens for an image, and
+#: routing has to know that or it will pick a small-window model.
+IMAGE_TOKEN_COST = 1_600
+
+
+def image_part(data: bytes, mime: str = "image/png") -> Dict[str, Any]:
+    """One image in the provider-neutral attachment format.
+
+    Deliberately just bytes plus a MIME type: that is the intersection of what
+    every vision API accepts. Provider-specific wrapping (base64 data URLs for
+    OpenAI-compatible, inline blobs for Gemini) belongs in the adapters.
+    """
+    if not data:
+        raise ValueError("image_part requires non-empty image data.")
+    if mime not in IMAGE_MIME_TYPES:
+        raise ValueError(f"Unsupported image type '{mime}'.")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"Image is {len(data) // 1024}KB; the limit is {MAX_IMAGE_BYTES // 1024}KB."
+        )
+    return {"kind": "image", "mime": mime, "data": data}
+
+
+def user_message(text: str, images: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """A user turn. The user's text is carried verbatim.
+
+    Images ride alongside the text rather than inside it, so every existing
+    reader of ``content`` keeps working unchanged and a text-only turn is
+    byte-for-byte what it was before images existed.
+    """
+    msg: Dict[str, Any] = {"role": "user", "content": text}
+    if images:
+        msg["images"] = list(images)
+    return msg
 
 
 def assistant_message(
@@ -289,13 +329,20 @@ def tool_message(tool_call_id: str, name: str, content: str) -> Dict[str, Any]:
 
 
 def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Rough token estimate (~4 chars/token) used for context-window routing."""
+    """Rough token estimate (~4 chars/token) used for context-window routing.
+
+    Images are charged separately: they dominate a vision turn's context cost,
+    and estimating them as a handful of characters would route a screenshot to
+    a model whose window cannot hold it.
+    """
     chars = 0
+    image_tokens = 0
     for msg in messages:
         chars += len(str(msg.get("content") or ""))
+        image_tokens += IMAGE_TOKEN_COST * len(msg.get("images") or [])
         for call in msg.get("tool_calls") or []:
             chars += len(call.get("name", "")) + len(str(call.get("arguments", "")))
-    return chars // 4
+    return chars // 4 + image_tokens
 
 
 # ---------------------------------------------------------------------------

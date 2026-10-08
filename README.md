@@ -19,6 +19,8 @@ Welcome to **JARVIS 2.0**, an AI companion upgraded from a monolithic keyword-ma
 
 - [x] **Phase 0: Functionality & Reliability Audit** (see `PHASE0_DIAGNOSIS.md`)
 - [x] **Phase 0.5: Provider-Agnostic Model Layer** (see below)
+- [x] **Phase 3: Vision, Webcam & Perception** (image vision + opt-in webcam perception)
+- [x] **Phase 4: Wake Word, Conversation State & Interruption** (see below)
 
 ## Model Layer (Phase 0.5)
 
@@ -56,6 +58,136 @@ curl http://localhost:8000/api/models | python3 -m json.tool
 Supported out of the box: Google Gemini, OpenRouter (free Nemotron / Ling
 models), and OpenCode Zen (community free models such as Space Bunny and Big
 Pickle). See `.env.example` for the optional keys.
+
+## Vision & Perception (Phase 3)
+
+Two visual inputs, one perception layer:
+
+- **Images you attach** — screenshots, photos, multi-image comparisons. Always
+  available, nothing to enable.
+- **The webcam** — quiet, opt-in background perception. **Off by default.**
+
+### The webcam is off until you turn it on
+
+`config.yaml`:
+
+```yaml
+vision:
+  enabled: true
+  webcam:
+    enabled: false        # <- the camera never opens until this is true
+```
+
+With it off, nothing about the camera runs: no device is opened, no thread is
+started, no log line is emitted. `python3 start.py --status` always prints the
+camera state, so what it is doing is never a guess.
+
+### How it stays cheap and quiet
+
+```text
+camera  ->  sample every Ns  ->  local change detection  ->  meaningful?
+             (configurable)        (Pillow, no model)          no -> discard
+                                                                   |
+                                                                   v
+                                              vision model, at most once per cooldown
+                                                                   |
+                                                          observation / inference
+                                                                   |
+                                                     current visual context (ephemeral)
+```
+
+- **Frames are sampled, not streamed.** `interval_seconds` (10s) is how often a
+  frame is even looked at.
+- **Change detection is local.** `jarvis/vision_change.py` reduces a frame to a
+  32x32 mean-centred greyscale signature and scores the *fraction of cells that
+  materially changed*. No model call, no network. Measured: a person arriving
+  scores 0.054, sensor noise and lighting drift both score 0.000.
+- **A cooldown caps the cost.** `analysis_cooldown_seconds` (120s) is a hard
+  ceiling on vision calls no matter how much the scene changes.
+- **Perception is silent.** A camera event updates internal context and says
+  nothing. Ask "what am I doing right now?" and the answer uses it.
+- **Perception cannot write memory.** Webcam analysis runs as an *ephemeral* turn:
+  no tools, no conversation history, and nothing recorded. Only an explicit
+  "remember this" writes to long-term memory, and that uses the existing memory
+  system — there is no second store.
+
+### What it will not do
+
+No facial recognition or identity inference, no emotion or health claims, no
+surveillance, no recording, no image archive. A perception turn carries no tools
+at all, so the camera cannot send mail, open a browser, or store anything.
+
+### Verify it
+
+```bash
+python3 scripts/phase3_live_check.py   # real camera if present, real model
+```
+
+## Voice & Conversation (Phase 4)
+
+Wake -> listen -> think -> speak -> follow-up -> interrupt, over **one**
+microphone.
+
+```text
+IDLE --wake--> LISTENING --speech end--> TRANSCRIBING --transcript--> THINKING
+      --> SPEAKING --done--> FOLLOW_UP --speech--> LISTENING | --timeout--> IDLE
+                                          --speech while busy--> INTERRUPTED
+```
+
+### Off by default, like the webcam
+
+```yaml
+wake_word:
+  enabled: false
+```
+
+While `enabled` is false the microphone is never opened, the wake-word model is
+never loaded, and text conversation is unaffected. `python3 start.py --status`
+always prints the voice state, so it is never a guess.
+
+### One microphone
+
+`jarvis/audio.py` owns the input device. The wake word, the voice-activity
+detector and speech recognition all consume the *same* frames as sinks on one
+stream. Previously the wake-word listener held a PyAudio stream while
+`speech.listen()` opened a second one through `speech_recognition.Microphone`.
+
+### State is the backend's
+
+`GET /api/state` is authoritative; the HUD renders it and never infers state
+from whether a reply arrived. `POST /api/voice/interrupt` stops a reply mid
+sentence. The frontend no longer keeps a local timer that guessed "speaking".
+
+### Interruption
+
+Every turn has an id (`turn_001`). Audio is tagged with the turn that produced
+it, and a barge-in marks the old turn stale *before* the new one starts, so
+queued audio and a slow model reply are both discarded rather than played late.
+Cancellation is cooperative: nothing is killed inside a native call, so
+shutdown stays race-free.
+
+### Making barge-in possible without waking yourself
+
+Three things, each added because measurement showed it was missing:
+
+- **Adaptive noise floor.** Speech is judged against the room's own measured
+  level, not an absolute threshold. Ambient RMS measured 0.046-0.14 on the
+  development machine — above any threshold tuned in a quiet room, so the
+  assistant heard permanent speech and interrupted itself.
+- **Echo cancellation.** Everything played is fed to a canceller that subtracts
+  the far-end reference from the microphone signal, searching a small lag
+  window for the output latency.
+- **Echo-gated wake word.** The wake word is suppressed while the assistant's
+  audio is in the air. The VAD keeps running underneath, so barge-in stays
+  possible.
+
+### Verify it
+
+```bash
+python3 scripts/phase4_live_check.py   # real mic, real speakers, real model
+```
+
+Checks needing a human to speak are reported SKIPPED rather than assumed.
 
 ## Getting Started
 

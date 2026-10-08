@@ -25,7 +25,9 @@ soundfile>=0.12.1
 # resemble-perth (a chatterbox dep) still imports pkg_resources, removed in setuptools 81
 setuptools<81
 # Optional STT + legacy Kokoro/pyttsx3 engines (Python 3.10-3.12 only for kokoro)
-# SpeechRecognition>=3.10.0
+# Phase 4 voice input consumes its PCM from the shared microphone stream instead
+# of opening a second capture device.
+SpeechRecognition>=3.10.0
 # pyttsx3>=2.90
 # kokoro>=0.7.0
 
@@ -33,3 +35,7 @@ setuptools<81
 openwakeword>=0.6.0
 pyaudio>=0.2.14
 numpy>=1.21.6
+
+# Webcam perception (Phase 3, opt-in via vision.webcam.enabled). Imported lazily
+# and only when the webcam is actually enabled; the app runs fine without it.
+opencv-python>=4.8.0

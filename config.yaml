@@ -311,10 +311,67 @@ speech:
   kokoro_speed: 1.0          # Speed multiplier (e.g. 1.0, 1.1)
   pyttsx3_rate: 180
 
+# ============================================================================
+# Voice (Phase 4) — wake word, endpointing, conversation window
+# ============================================================================
+# The wake word is opt-in, like the webcam. While `enabled` is false the
+# microphone is never opened, the wake-word model is never loaded, and voice
+# turns nothing off: text conversation is unaffected either way.
 wake_word:
-  # openWakeWord settings (Phase 6)
+  enabled: false
   model: "hey_jarvis"        # Pre-trained model: hey_jarvis, hey_mycroft, alexa, etc.
   threshold: 0.5             # Confidence threshold (0.0-1.0), higher = more strict
+  # Assistant speech ignored after playback stops, so the tail of a reply cannot
+  # re-trigger the wake word through the speakers.
+  echo_cooldown_seconds: 0.6
+
+# Voice activity detection (energy based, local, no extra dependency).
+vad:
+  energy_threshold: 0.01     # RMS (0..1) at which a frame counts as voiced
+  min_speech_ms: 200         # voiced time before a burst is a real utterance
+  end_silence_ms: 700        # quiet time that ends the utterance
+  barge_in_ms: 300           # voiced time needed to interrupt the assistant
+  # Speech must clear the measured room floor by these margins. The absolute
+  # threshold above is only the floor of that decision, so a quiet room behaves
+  # as configured and a noisy one stops reading the noise as speech.
+  snr: 3.0
+  barge_in_snr: 4.0
+  # barge_in_threshold defaults to 2x energy_threshold; uncomment to override.
+  # barge_in_threshold: 0.02
+
+conversation:
+  follow_up_window_s: 8      # keep listening this long after speaking
+  sample_rate: 16000         # int16 mono; shared by wake word, VAD and ASR
+  frame_ms: 80               # 80ms frames (~200 wake-word inferences/second)
+  tts_chunk_ms: 220          # speech synthesis chunk size
+  # input_device: 1          # microphone index; omit for the system default
+
+# ============================================================================
+# Vision / Perception (Phase 3)
+# ============================================================================
+# Images you attach are always analysed — there is nothing to enable for that.
+# The webcam is a separate, deliberate opt-in and is OFF unless you turn it on.
+vision:
+  enabled: true
+
+  webcam:
+    # The camera is never opened unless this is true. Default is false.
+    enabled: false
+    device: 0                 # 0 = default camera
+    interval_seconds: 10      # sample one frame this often
+    analysis_cooldown_seconds: 120   # hard ceiling on vision calls
+    # Fraction of the frame that must have changed for a frame to be analysed.
+    # 0.02 catches a person arriving/leaving and objects appearing/going, and
+    # ignores lighting drift and sensor noise entirely. Fine changes (glasses)
+    # score ~0.012; lower this to 0.005 to catch them -- the cooldown above
+    # still bounds the cost.
+    change_threshold: 0.02
+    change_noise_floor: 0.06        # brightness move counted as a real change
+    comparison_size: 32             # edge size frames are reduced to for comparison
+    context_ttl_seconds: 600  # how long the current visual context stays usable
+    max_observations: 6       # observations kept in the current visual context
+    max_frame_side: 640       # frames are downscaled to this before analysis
+    jpeg_quality: 70
 
 logging:
   # Phase 8: Rotating file logging

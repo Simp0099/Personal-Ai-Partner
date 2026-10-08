@@ -31,9 +31,10 @@ Design notes:
 
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from jarvis.config import DATA_DIR
 from jarvis.logger import logger
@@ -42,6 +43,23 @@ from jarvis.logger import logger
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 MEMORY_DB_PATH = DATA_DIR / "jarvis_memory.db"
+
+#: The Brain owns one long-lived connection, and Phase 4 gave it a second
+#: thread: the voice turn loop runs `ask()` while the API thread may be answering
+#: a typed message at the same moment. sqlite3 refuses cross-thread use of a
+#: connection by default, and that refusal was being swallowed by the retrieval
+#: guard in the Brain -- so voice turns silently lost memory instead of
+#: reporting an error.
+#:
+#: So the connection is opened with `check_same_thread=False` and every access is
+#: serialised through this lock. Cross-thread use is then deliberate and safe
+#: rather than accidental and swallowed.
+_DB_LOCK = threading.RLock()
+
+
+def db_locked():
+    """The shared-connection lock. Re-entrant."""
+    return _DB_LOCK
 
 #: Recommended categories, used to guide the model when it writes. Not a
 #: whitelist: stored categories are free-form so existing grouping survives.
@@ -61,7 +79,8 @@ def init_memory_db(db_path: Path = None) -> sqlite3.Connection:
         An open SQLite connection with row factory set.
     """
     path = db_path or MEMORY_DB_PATH
-    conn = sqlite3.connect(str(path))
+    # Safe because every access holds db_locked(); see _DB_LOCK above.
+    conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS memories (
@@ -103,6 +122,77 @@ def _migrate(conn: sqlite3.Connection) -> None:
             (normalize(row["fact"]), row["id"]),
         )
 
+    _reconcile_stale(conn)
+
+
+def _reconcile_stale(conn: sqlite3.Connection) -> None:
+    """Retire legacy rows that a newer memory has already superseded.
+
+    Supersession is keyed on `subject`, so it only works once both rows agree on
+    one. A row written before keys existed carries its own text as its key and
+    would otherwise sit beside the current fact forever -- "the user's name is
+    Ravi" staying active after "the user's name is Alex" was stored.
+
+    The generic rule: when several active facts are about the same *thing*,
+    keep the most recently written. What identifies "the same thing" is the
+    subject key when it is a known shared key, and otherwise the fact's
+    predicate skeleton -- the leading "the user prefers X" / "name is X" shape
+    with the differing value removed. Nothing here is specific to any user.
+    """
+    rows = conn.execute(
+        "SELECT id, fact, subject, created_at FROM memories "
+        "WHERE active = 1 ORDER BY COALESCE(updated_at, created_at) DESC, id DESC"
+    ).fetchall()
+
+    known_subjects = {
+        r["subject"] for r in rows if r["subject"] and r["subject"] != normalize(r["fact"])
+    }
+
+    kept: Dict[str, int] = {}
+    for row in rows:
+        skeleton = _fact_skeleton(row["fact"])
+        if skeleton:
+            group_key = f"skeleton:{skeleton}"
+        elif row["subject"] in known_subjects:
+            group_key = f"subject:{row['subject']}"
+        else:
+            continue
+
+        if group_key in kept:
+            conn.execute(
+                "UPDATE memories SET active = 0 WHERE id = ?", (row["id"],)
+            )
+            logger.info(
+                f"Memory reconciled: retired #{row['id']} "
+                f"('{row['fact']}') as superseded by #{kept[group_key]}"
+            )
+        else:
+            kept[group_key] = row["id"]
+
+    conn.commit()
+
+
+def _fact_skeleton(fact: str) -> str:
+    """The shape of a fact with its most specific value dropped.
+
+    "the user's name is Alex" and "the user's name is Ravi" both reduce to
+    "the user name is", which is what makes them recognisable as the same
+    subject. Returns "" when nothing distinctive is left to compare.
+    """
+    text = normalize(fact)
+    if not text:
+        return ""
+    # The final token of "X is <value>" / "X prefers <value>" is the value; the
+    # rest is the claim. Only treat it as a skeleton when the tail looks like a
+    # bare value rather than a sentence.
+    match = re.match(r"^(.*?)\s+(?:is|are|was|were|prefers?|likes?|uses?|has)\s+(.+)$", text)
+    if not match:
+        return ""
+    claim, value = match.group(1), match.group(2)
+    if len(value.split()) > 4 or not claim:
+        return ""
+    return claim
+
 
 #: Words carrying no retrieval signal. Deliberately small: an aggressive stop
 #: list hides real matches in short messages like "what about Python?".
@@ -112,9 +202,129 @@ _STOPWORDS = frozenset({
     "and", "or", "but", "if", "then", "so", "to", "of", "in", "on", "at",
     "for", "with", "about", "from", "by", "do", "does", "did", "have", "has",
     "had", "can", "could", "would", "should", "will", "shall", "may", "not",
+    # Structural words every stored fact tends to share. Matching on these
+    # makes unrelated memories look relevant to each other: without this,
+    # "Project atlas" and "Project borealis" score against each other purely
+    # because both say "project" and "uses".
+    "user", "users", "prefers", "prefer", "likes", "like", "uses", "use",
+    "used", "using", "project", "projects", "app", "please", "always",
+    "never", "still", "also", "just", "very", "some", "any", "all",
 })
 
 _WORD_RE = re.compile(r"[a-z0-9_+#.-]+")
+
+#: Phrases that mean a fact is really a secret. Visual input makes this a live
+#: risk: a screenshot of a terminal or an .env file contains credentials the
+#: user never meant to be remembered.
+_SECRET_MARKERS = re.compile(
+    # No trailing \b: env-style names like AWS_SECRET_ACCESS_KEY use underscores
+    # as separators, and \b does not fire between "_" and a letter.
+    r"(api[_\- ]?key|secret[_\- ]?key|access[_\- ]?token|refresh[_\- ]?token|"
+    r"auth[_\- ]?token|password|passwd|private[_\- ]?key|client[_\- ]?secret|"
+    r"bearer|authorization|credential|aws[_\- ]?secret|access[_\- ]?key)",
+    re.IGNORECASE,
+)
+
+
+def contains_secret(fact: str) -> bool:
+    """True when a fact looks like it carries a credential.
+
+    Checked before anything is written, so an image of a leaked key does not
+    become durable memory on the way past.
+    """
+    return bool(_SECRET_MARKERS.search(fact or ""))
+
+#: Concept groups: vocabulary that means the same thing in this domain. These
+#: bridge paraphrases that share no characters at all -- "what theme do I like"
+#: against a stored "prefers dark mode" -- which pure overlap scoring cannot do.
+#:
+#: Deliberately small and domain-specific. Broad groups ("technology", "work")
+#: would make unrelated memories match, which is worse than missing one.
+#: Both sides must contain a member of the same group for it to count, so a
+#: group only ever links memories that are genuinely about the same thing.
+_CONCEPTS = (
+    frozenset({"theme", "dark", "light", "colour", "color", "scheme",
+               "appearance", "aesthetic"}),
+    frozenset({"database", "db", "datastore", "postgres", "postgresql", "mysql",
+               "sqlite", "dynamodb", "mongo", "storage", "persistence"}),
+    frozenset({"language", "python", "javascript", "typescript", "rust", "golang",
+               "java", "ruby", "swift", "kotlin"}),
+    frozenset({"deploy", "deployed", "deployment", "ship", "shipped", "release",
+               "pipeline", "rollout"}),
+    frozenset({"test", "tests", "testing", "pytest", "jest", "vitest", "unittest"}),
+    frozenset({"editor", "ide", "vim", "emacs", "neovim", "vscode"}),
+    frozenset({"timezone", "tz", "utc", "ist", "gmt", "zone"}),
+    frozenset({"name", "called", "named"}),
+    frozenset({"project", "app", "application", "codebase", "repo", "repository"}),
+    frozenset({"laptop", "machine", "computer", "pc", "workstation"}),
+)
+
+#: Minimum score for a memory to be considered relevant. A concept-only match
+#: scores exactly this, so paraphrases qualify while unrelated pairs do not.
+_RELEVANCE_THRESHOLD = 2
+
+_SUFFIXES = ("ing", "ies", "ed", "es", "s")
+
+
+def _stem(word: str) -> str:
+    """Crude suffix stripping: enough to make 'prefers' match 'prefer'."""
+    for suffix in _SUFFIXES:
+        if len(word) > len(suffix) + 2 and word.endswith(suffix):
+            base = word[: -len(suffix)]
+            return base[:-1] if suffix == "ies" else base
+    return word
+
+
+def _trigrams(word: str) -> set:
+    padded = f"  {word} "
+    return {padded[i:i + 3] for i in range(len(padded) - 2)}
+
+
+def _concepts(tokens: set) -> set:
+    """Indices of concept groups this token set touches."""
+    return {i for i, group in enumerate(_CONCEPTS) if tokens & group}
+
+
+def _score(query_tokens: set, fact_tokens: set) -> Tuple[float, float]:
+    """Relevance of one memory to a query, as ``(score, lexical)``.
+
+    Hybrid by design: exact overlap dominates, morphology and character
+    similarity catch near-misses, and a shared concept catches genuine
+    paraphrase. Fully local, deterministic, and needs no network or model.
+
+    The second value is the part of the score earned from actual wording.
+    Callers need it to prefer a specific match over a merely adjacent one --
+    "which database does atlas use" should reach the atlas memory, not every
+    memory that mentions a database.
+    """
+    if not query_tokens or not fact_tokens:
+        return 0.0, 0.0
+
+    score = 0.0
+    lexical = 0.0
+    lexical += 3.0 * len(query_tokens & fact_tokens)
+
+    query_stems = {_stem(t) for t in query_tokens}
+    fact_stems = {_stem(t) for t in fact_tokens}
+    # Only count stems that are not already rewarded as exact matches.
+    lexical += 2.0 * len((query_stems & fact_stems) - (query_tokens & fact_tokens))
+
+    # Character-level near-miss, for typos and irregular plurals.
+    for q in query_stems - fact_stems:
+        q_grams = _trigrams(q)
+        if len(q_grams) < 3:
+            continue
+        for f in fact_stems:
+            f_grams = _trigrams(f)
+            shared = len(q_grams & f_grams)
+            if shared / max(len(q_grams), len(f_grams)) >= 0.8:
+                lexical += 2.0
+                break
+
+    score += lexical
+    # Shared concept: both sides talk about the same thing.
+    score += 2.0 * len(_concepts(query_tokens) & _concepts(fact_tokens))
+    return score, lexical
 
 
 def normalize(fact: str) -> str:
@@ -163,6 +373,13 @@ def remember(
     """
     clean = (fact or "").strip()
     if not clean:
+        return False
+
+    if contains_secret(clean):
+        # Refuse rather than store-and-redact: a half-stored credential is still
+        # a credential in the database, and the useful part of the fact is
+        # usually the non-secret part.
+        logger.warning("Refused to store a memory that appears to contain a secret.")
         return False
 
     key = subject_of(clean, subject)
@@ -285,11 +502,15 @@ def recall_relevant(
         if subject in seen_subjects:
             continue
         seen_subjects.add(subject)
-        overlap = len(query_tokens & tokenize(row["fact"]))
-        scored.append((overlap, row["fact"], row["category"]))
+        score, lexical = _score(query_tokens, tokenize(row["fact"]))
+        scored.append((score, lexical, row["fact"], row["category"]))
 
     # Stable sorts: score desc, then recency order preserved by the SELECT.
     scored.sort(key=lambda item: item[0], reverse=True)
+
+    # A memory matched only because it shares a concept is adjacent, not
+    # relevant. If anything matched on actual wording, adjacency loses.
+    best_lexical = max((item[1] for item in scored), default=0.0)
 
     picked = []
     seen = set()
@@ -298,14 +519,16 @@ def recall_relevant(
             picked.append((fact, "context"))
             seen.add(fact)
 
-    for overlap, fact, category in scored:
+    for score, lexical, fact, category in scored:
         if len(picked) >= limit:
             break
         if fact in seen:
             continue
-        # Zero overlap means unrelated: an unrelated personal preference must
-        # not ride along on every prompt.
-        if overlap == 0:
+        # Below threshold means unrelated. An unrelated personal preference must
+        # not ride along on every prompt just because it scored above zero.
+        if score < _RELEVANCE_THRESHOLD:
+            continue
+        if lexical == 0.0 and best_lexical > 0.0:
             continue
         picked.append((fact, category))
         seen.add(fact)

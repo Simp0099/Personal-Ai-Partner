@@ -94,10 +94,18 @@ def _to_gemini_content(messages: List[Dict[str, Any]], types: Any) -> List[Any]:
 
         else:  # user / system-fallback
             content = msg.get("content")
+            images = msg.get("images") or []
+            parts = []
             if content:
-                contents.append(types.Content(
-                    role="user", parts=[types.Part(text=content)]
-                ))
+                parts.append(types.Part(text=content))
+            # Images become inline blobs. Text first, then images, so the model
+            # reads the question before it looks at the evidence.
+            for img in images:
+                parts.append(types.Part(inline_data=types.Blob(
+                    mime_type=img["mime"], data=img["data"]
+                )))
+            if parts:
+                contents.append(types.Content(role="user", parts=parts))
 
     return contents
 
@@ -115,7 +123,22 @@ class GeminiChatSession(ChatSession):
         kind = payload.get("kind")
 
         if kind == "user":
-            content: Any = payload["text"]
+            text = payload.get("text") or ""
+            images = payload.get("images") or []
+            if images:
+                # Gemini's chat API takes a bare list of Parts for a turn; a
+                # Content object is not accepted here. Text first, then images,
+                # so the model reads the question before it looks.
+                parts = []
+                if text:
+                    parts.append(types.Part(text=text))
+                for img in images:
+                    parts.append(types.Part(inline_data=types.Blob(
+                        mime_type=img["mime"], data=img["data"]
+                    )))
+                content: Any = parts
+            else:
+                content = text
         elif kind == "tool_results":
             parts = [
                 types.Part(function_response=types.FunctionResponse(

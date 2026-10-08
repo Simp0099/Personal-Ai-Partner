@@ -207,9 +207,115 @@ KOKORO_SPEED = float(_SPEECH.get("kokoro_speed", 1.0))
 
 PYTTSX3_RATE = int(_SPEECH.get("pyttsx3_rate", 180))
 
-# Wake Word Settings (Phase 6 - openWakeWord)
-WAKE_WORD_MODEL = CONFIG.get("wake_word", {}).get("model", "hey_jarvis")
-WAKE_WORD_THRESHOLD = float(CONFIG.get("wake_word", {}).get("threshold", 0.5))
+# ---------------------------------------------------------------------------
+# Vision / Perception (Phase 3)
+# ---------------------------------------------------------------------------
+# Two independent visual inputs share one perception layer:
+#   * images the user attaches (always available, never automatic), and
+#   * the webcam (opt-in, off by default).
+#
+# The webcam being off by default is the point: opening a camera is a decision
+# the user makes in this file, never a side effect of starting the assistant.
+_VISION = CONFIG.get("vision", {}) or {}
+_WEBCAM = _VISION.get("webcam", {}) or {}
+
+VISION_ENABLED = bool(_VISION.get("enabled", True))
+
+WEBCAM_ENABLED = bool(_WEBCAM.get("enabled", False))
+WEBCAM_DEVICE = int(_WEBCAM.get("device", 0))
+
+# Seconds between sampled frames. The camera runs continuously; nothing is
+# captured or analysed faster than this.
+WEBCAM_INTERVAL_SECONDS = float(_WEBCAM.get("interval_seconds", 10.0))
+
+# Minimum seconds between vision model calls. The ceiling on cost: however
+# much the scene changes, the model is consulted at most this often.
+WEBCAM_ANALYSIS_COOLDOWN = float(_WEBCAM.get("analysis_cooldown_seconds", 120.0))
+
+# Local change detection. A frame is compared against the previous one at this
+# resolution, and the change score is the fraction of cells whose brightness
+# moved by more than `change_noise_floor`.
+#
+# The threshold is a fraction of the frame, not an average brightness change: a
+# mean cannot tell a person sitting down (0.0240) from a window shade opening
+# (0.0235), while as materially-changed-cell fractions those are 0.054 and 0.000.
+# 0.02 catches people and objects and ignores lighting drift and sensor noise.
+#
+# It does not catch fine appearance changes such as glasses — those are ~1% of
+# the frame, too close to real sensor noise to threshold honestly. Lower
+# `change_threshold` to try; the analysis cooldown still bounds the cost.
+WEBCAM_CHANGE_THRESHOLD = float(_WEBCAM.get("change_threshold", 0.02))
+WEBCAM_CHANGE_NOISE_FLOOR = float(_WEBCAM.get("change_noise_floor", 0.06))
+WEBCAM_SAMPLE_SIZE = int(_WEBCAM.get("comparison_size", 32))
+
+# How long the current visual context stays usable, and how many observations it
+# holds. Short-lived by design: this is context, not memory.
+WEBCAM_CONTEXT_TTL = float(_WEBCAM.get("context_ttl_seconds", 600.0))
+WEBCAM_MAX_OBSERVATIONS = int(_WEBCAM.get("max_observations", 6))
+
+# Frame downscale before analysis: keeps uploads and vision cost down.
+WEBCAM_MAX_SIDE = int(_WEBCAM.get("max_frame_side", 640))
+WEBCAM_JPEG_QUALITY = int(_WEBCAM.get("jpeg_quality", 70))
+
+# ---------------------------------------------------------------------------
+# Voice (Phase 4) -- wake word, endpointing, conversational state machine
+# ---------------------------------------------------------------------------
+# Reuses the existing `wake_word:` block rather than adding a parallel `wake:`
+# section -- two sections meaning the same thing is how a threshold ends up set
+# in one place and read from the other.
+_WAKE = CONFIG.get("wake_word", {}) or {}
+_VAD = CONFIG.get("vad", {}) or {}
+_CONVERSATION = CONFIG.get("conversation", {}) or {}
+
+# openWakeWord settings (Phase 6)
+WAKE_WORD_MODEL = _WAKE.get("model", "hey_jarvis")
+WAKE_WORD_THRESHOLD = float(_WAKE.get("threshold", 0.5))
+
+# Phase 4: the wake word is opt-in like the webcam. `enabled` gates the whole
+# voice pipeline, not just detection, so a disabled wake word leaves text mode
+# completely untouched.
+WAKE_WORD_ENABLED = bool(_WAKE.get("enabled", False))
+#: Seconds of assistant speech that must be ignored after playback stops, so the
+#: tail of a reply cannot re-trigger the wake word through the speakers.
+WAKE_WORD_ECHO_COOLDOWN = float(_WAKE.get("echo_cooldown_seconds", 0.6))
+
+# Audio capture. int16 mono at 16kHz is what both openWakeWord and
+# SpeechRecognition expect, so one stream serves all three consumers.
+AUDIO_SAMPLE_RATE = int(_CONVERSATION.get("sample_rate", 16000))
+AUDIO_CHANNELS = 1
+AUDIO_FRAME_MS = int(_CONVERSATION.get("frame_ms", 80))
+AUDIO_INPUT_DEVICE = _CONVERSATION.get("input_device")   # None = system default
+
+# Voice activity detection. Energy over RMS, local and deterministic.
+#: Minimum RMS (0..1) for a frame to count as voiced during normal listening.
+VAD_ENERGY_THRESHOLD = float(_VAD.get("energy_threshold", 0.01))
+#: Quiet time that ends an utterance.
+VAD_END_SILENCE_MS = float(_VAD.get("end_silence_ms", 700))
+#: Voiced time required before a burst counts as speech. Filters clicks, taps
+#: and other single-frame pops.
+VAD_MIN_SPEECH_MS = float(_VAD.get("min_speech_ms", 200))
+#: Voiced time required to interrupt the assistant. Higher than min_speech on
+#: purpose: interrupting mid-sentence should take intent.
+VAD_BARGE_IN_MS = float(_VAD.get("barge_in_ms", 300))
+#: Energy floor for barge-in. Defaults to 2x the normal threshold (see
+#: VoiceActivityDetector), because the microphone is also hearing the speakers.
+VAD_BARGE_IN_THRESHOLD = (
+    float(_VAD["barge_in_threshold"]) if "barge_in_threshold" in _VAD else None
+)
+
+# Signal-to-noise margins above the measured room floor. These, not the absolute
+# thresholds, are what decide what counts as speech in a loud room: ambient RMS
+# measured 0.046-0.14 on the development machine, above any absolute threshold
+# tuned in a quiet one.
+VAD_SNR = float(_VAD.get("snr", 3.0))
+VAD_BARGE_IN_SNR = float(_VAD.get("barge_in_snr", 4.0))
+
+#: How long the assistant keeps listening after it finishes speaking, so a
+#: follow-up does not need the wake word again.
+FOLLOW_UP_WINDOW_S = float(_CONVERSATION.get("follow_up_window_s", 8.0))
+#: Speech synthesis chunk size. Smaller chunks start audio sooner and make
+#: barge-in cut in faster; larger chunks play more smoothly.
+TTS_CHUNK_MS = int(_CONVERSATION.get("tts_chunk_ms", 220))
 
 # Logging Settings (Phase 8)
 LOG_FILE = DATA_DIR / "jarvis.log"

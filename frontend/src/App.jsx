@@ -27,9 +27,10 @@ export default function App() {
     assistantState,
     latency,
     isThinking,
+    isVoiceActive,
     sendMessage,
-    toggleListening,
-    clearChat,
+    interrupt,
+    toggleVoice,
   } = useJarvisState()
 
   return (
@@ -39,6 +40,8 @@ export default function App() {
         isConnected={isConnected}
         isListening={isListening}
         isSpeaking={isSpeaking}
+        isVoiceActive={isVoiceActive}
+        assistantState={assistantState}
         latency={latency}
       />
 
@@ -48,10 +51,10 @@ export default function App() {
         <div className="mobile-header-actions">
           <button
             className="mobile-icon-btn"
-            onClick={toggleListening}
-            title={isListening ? 'Stop listening' : 'Start listening'}
+            onClick={isSpeaking ? interrupt : toggleVoice}
+            title={isSpeaking ? 'Interrupt' : (isVoiceActive ? 'Stop voice input' : 'Start voice input')}
           >
-            {isListening ? '🎤' : '🎙️'}
+            {isSpeaking ? '⏹' : (isVoiceActive ? '🎤' : '🎙️')}
           </button>
           <button
             className="mobile-icon-btn"

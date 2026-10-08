@@ -57,6 +57,32 @@ def check_environment():
     config_file = PROJECT_ROOT / "config.yaml"
     print(f"[Check] config.yaml: {'Found' if config_file.exists() else 'NOT FOUND'}")
 
+    # Camera state, always shown. OpenCV is only required when the webcam is
+    # actually enabled, so a missing install is not a startup error.
+    try:
+        from jarvis.config import VISION_ENABLED, WEBCAM_ENABLED
+        if VISION_ENABLED and WEBCAM_ENABLED:
+            import cv2
+            print(f"[Check] Webcam perception: ON, OpenCV {cv2.__version__}")
+        else:
+            print(f"[Check] Webcam perception: off by config (camera not opened)")
+    except ImportError:
+        print(f"[Check] Webcam perception: OpenCV not installed (needed only if enabled)")
+
+    # Voice. Reported whether or not it is enabled, for the same reason as the
+    # camera: you can see that the microphone is off.
+    try:
+        from jarvis.config import WAKE_WORD_ENABLED, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD
+        if WAKE_WORD_ENABLED:
+            import speech_recognition  # noqa: F401
+            print(f"[Check] Voice: ON — wake word '{WAKE_WORD_MODEL}' "
+                  f"(threshold {WAKE_WORD_THRESHOLD})")
+        else:
+            print(f"[Check] Voice: off by config (microphone will not be opened)")
+    except ImportError as e:
+        print(f"[Check] Voice: enabled but speech recognition is unavailable ({e}). "
+              f"Text conversation still works.")
+
     # Check data directory
     data_dir = PROJECT_ROOT / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +138,8 @@ def show_status():
         ASSISTANT_NAME, GREETING_NAME, LLM_MODEL,
         WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD,
         MAX_HISTORY_MESSAGES, TTS_ENGINE,
+        VISION_ENABLED, WEBCAM_ENABLED, WEBCAM_INTERVAL_SECONDS,
+        WEBCAM_ANALYSIS_COOLDOWN,
     )
     from jarvis.logger import logger
 
@@ -125,6 +153,28 @@ def show_status():
     print(f"  TTS Engine:    {TTS_ENGINE}")
     print(f"  Wake Word:     {WAKE_WORD_MODEL} (threshold: {WAKE_WORD_THRESHOLD})")
     print(f"  Max History:   {MAX_HISTORY_MESSAGES} messages")
+
+    # The camera's state is printed unconditionally, not only when enabled: the
+    # point of a privacy feature is that you can see it is off.
+    print(f"  Vision:        {'enabled' if VISION_ENABLED else 'disabled'}")
+    if VISION_ENABLED and WEBCAM_ENABLED:
+        print(f"  Webcam:        ON — sampled every {WEBCAM_INTERVAL_SECONDS}s, "
+              f"analysed at most every {WEBCAM_ANALYSIS_COOLDOWN}s. "
+              f"Nothing is recorded or saved.")
+    else:
+        print(f"  Webcam:        off (no camera is opened)")
+
+    try:
+        from jarvis.voice_loop import get_voice_loop
+        loop = get_voice_loop()
+    except Exception:
+        loop = None
+    if loop is not None and loop.is_running():
+        print(f"  Voice:         ON — wake '{loop.wake_engine.model}', "
+              f"follow-up {loop.follow_up_window:.0f}s, "
+              f"mic {'open' if loop.microphone.available else 'unavailable'}")
+    else:
+        print(f"  Voice:         off (microphone is not opened)")
 
     # Memory stats
     try:
