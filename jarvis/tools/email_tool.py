@@ -13,12 +13,39 @@ from jarvis.speech import speak, listen
 from jarvis.config import GMAIL_ADDRESS, GMAIL_APP_PASSWORD, CONTACTS
 from jarvis.logger import logger
 
+# Explicit affirmative replies. Anything else -- no, cancel, stop, ambiguous,
+# empty, "none" (non-interactive) -- is unconfirmed and must NOT send.
+AFFIRMATIVE = frozenset({
+    "yes", "y", "yeah", "yep", "yes please", "send it", "do it",
+    "confirm", "confirmed", "go ahead", "send",
+})
+
+
+def parse_confirmation(reply) -> bool:
+    """True only for a clearly affirmative confirmation. Strict by design."""
+    text = " ".join(str(reply or "").strip().lower().split()).rstrip("?!.")
+    return (text in AFFIRMATIVE or text.startswith("yes ")
+            or text.startswith("yes,"))
+
 
 def send_email(to_address: str, subject: str, content: str) -> bool:
-    """Send an email using SMTP over TLS with credentials loaded from environment."""
+    """Send an email using SMTP over TLS with credentials loaded from environment.
+
+    Safety gate: explicit user confirmation is required BEFORE the irreversible
+    SMTP dispatch, on every path that reaches this function (tool registry,
+    LLM tool loop, interactive handler). Unconfirmed means unsent.
+    Recipient and subject may be logged; the body never is.
+    """
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
         speak("Gmail credentials are not configured in your .env file.")
         logger.warning("Missing GMAIL_ADDRESS or GMAIL_APP_PASSWORD in .env.")
+        return False
+
+    logger.info(f"Email send requested: recipient={to_address} subject={subject!r}")
+    speak(f"Send this email to {to_address}? (yes/no)")
+    if not parse_confirmation(listen("Answer (yes/no): ")):
+        logger.info(f"Email send unconfirmed: recipient={to_address} subject={subject!r}")
+        speak("Email not sent.")
         return False
 
     try:
@@ -35,10 +62,11 @@ def send_email(to_address: str, subject: str, content: str) -> bool:
         server.send_message(msg)
         server.quit()
 
+        logger.info(f"Email sent: recipient={to_address} subject={subject!r}")
         speak(f"Email successfully sent to {to_address}!")
         return True
     except Exception as e:
-        logger.error(f"Email error: {e}", exc_info=True)
+        logger.error(f"Email error for {to_address}: {e}", exc_info=True)
         speak("Sorry, I was unable to send the email.")
         return False
 
