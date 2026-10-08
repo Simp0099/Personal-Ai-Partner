@@ -5,8 +5,7 @@ Covers four defects found at the end of Phase 2:
 1. Retrieval was blind to paraphrase ("what theme do I like" vs
    "prefers dark mode").
 2. Stale legacy facts stayed active beside the fact that replaced them.
-3. Starlette ``TestClient`` instances were never closed, leaking ``anyio``
-   portal daemon threads that raced native teardown at interpreter exit.
+3. A brain turn must not leak daemon threads (native-teardown race at exit).
 4. An empty model reply after a tool loop returned the idle fallback
    "Standing by, Boss.", hiding the fact that tools had actually run.
 """
@@ -206,20 +205,6 @@ class TestStaleMemoryReconciliation:
 # ============================================================================
 
 class TestShutdownLifecycle:
-    def test_test_client_is_closed(self):
-        """The defect: a bare TestClient leaks an anyio portal thread."""
-        from fastapi.testclient import TestClient
-        import api_server
-
-        before = threading.active_count()
-        with TestClient(api_server.app):
-            pass
-        for _ in range(50):
-            if threading.active_count() <= before:
-                break
-            threading.Event().wait(0.02)
-        assert threading.active_count() <= before, "portal thread outlived the client"
-
     def test_no_daemon_thread_survives_a_turn(self, monkeypatch):
         import jarvis.brain as brain_module
         layer = build_layer(

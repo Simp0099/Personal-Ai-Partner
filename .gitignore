@@ -34,10 +34,14 @@ venv/
 env/
 ENV/
 
-# Data & local databases
-data/
-data/screenshots/*
-!data/screenshots/.gitkeep
+# Runtime data — user-local assistant state, never committed.
+# (Nothing under data/ is distributed: memory DBs, screenshots, and logs are
+# all created at runtime. Static assets ship beside the code, not here.)
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.log*
+data/screenshots/
 *.db
 *.sqlite3
 jarvis_memory.db
@@ -50,3 +54,23 @@ jarvis_memory.db
 .idea/
 .vscode/
 *.swp
+
+# Test / typecheck / coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+
+# Runtime logs (rotating app log lives under data/, which is already ignored)
+logs/
+*.log
+*.log.*
+
+# Model/cache directories that are machine-local
+.cache/
+
+# Node/frontend artifacts (no frontend ships; belt and suspenders)
+node_modules/

@@ -181,7 +181,7 @@ class ModelLayer:
     # ------------------------------------------------------------------
 
     def status(self) -> Dict[str, Any]:
-        """Model status snapshot for the debug endpoint. No credentials."""
+        """Model status snapshot for diagnostics. No credentials."""
         return {
             "routing_enabled": self.router.config.enabled,
             "weights": {

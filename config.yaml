@@ -277,7 +277,6 @@ routing:
 debug:
   # Development-only: log exact user input, routing decision, chosen model.
   log_input: false
-  endpoints: true            # expose GET /api/models for development
 
 weather:
   default_city: "Delhi"

@@ -31,11 +31,9 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
-RESOURCES_DIR = PROJECT_ROOT / "resources"
 
 # Ensure runtime directories exist
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Load secrets from .env file
 load_dotenv(PROJECT_ROOT / ".env")
@@ -100,11 +98,6 @@ ROUTING_CONFIG = CONFIG.get("routing", {}) or {}
 # message list handed to the model. Never logs API keys or credentials.
 # ---------------------------------------------------------------------------
 DEBUG_INPUT = str(CONFIG.get("debug", {}).get("log_input", False)).lower() in (
-    "1", "true", "yes", "on",
-)
-
-# Expose model/provider status on the API for development use.
-DEBUG_ENDPOINTS = str(CONFIG.get("debug", {}).get("endpoints", True)).lower() in (
     "1", "true", "yes", "on",
 )
 

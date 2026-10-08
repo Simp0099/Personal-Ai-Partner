@@ -47,7 +47,6 @@ class TestSecurityAudit:
         jarvis_files = [
             p for p in (PROJECT_ROOT / "jarvis").rglob("*.py") if "__pycache__" not in str(p)
         ]
-        jarvis_files.append(PROJECT_ROOT / "api_server.py")
         jarvis_files.append(PROJECT_ROOT / "start.py")
 
         # A credential-shaped literal: a long opaque token, or a known key prefix.

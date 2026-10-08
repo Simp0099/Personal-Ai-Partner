@@ -449,16 +449,3 @@ class TestShutdown:
             ObservationEngine().note(obs("A person is sitting at a desk."))
             ProactiveOrchestrator().maybe_proactive(None, good_snap(), lambda d: "x")
         assert threading.active_count() <= before
-
-
-# API surface --------------------------------------------------------------------------------------
-
-class TestApi:
-    def test_state_exposes_proactive_without_internals(self):
-        import asyncio
-        import api_server
-        payload = asyncio.run(api_server.conversation_state())
-        assert "proactive" in payload
-        blob = str(payload["proactive"])
-        for banned in ("api_key", "prompt", "reasoning", "frame"):
-            assert banned not in blob.lower()

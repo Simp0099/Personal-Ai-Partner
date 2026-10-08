@@ -9,7 +9,7 @@ import sys
 import subprocess
 import datetime
 from jarvis.speech import speak, listen
-from jarvis.config import SCREENSHOT_DIR, RESOURCES_DIR
+from jarvis.config import SCREENSHOT_DIR
 from jarvis.logger import logger
 
 
