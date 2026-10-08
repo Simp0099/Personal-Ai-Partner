@@ -342,6 +342,26 @@ FOLLOW_UP_WINDOW_S = float(_CONVERSATION.get("follow_up_window_s", 8.0))
 #: barge-in cut in faster; larger chunks play more smoothly.
 TTS_CHUNK_MS = int(_CONVERSATION.get("tts_chunk_ms", 220))
 
+# ---------------------------------------------------------------------------
+# Proactive partner (Phase 6) -- when JARVIS may initiate conversation
+# ---------------------------------------------------------------------------
+# Conservative by default: the decision engine's answer is NO unless every
+# gate passes. Nothing here opens a camera or microphone; those stay opt-in
+# under `vision:` and `wake_word:`.
+_PROACTIVE = CONFIG.get("proactive", {}) or {}
+_PROACTIVE_QUIET = _PROACTIVE.get("quiet_hours", {}) or {}
+
+PROACTIVE_ENABLED = bool(_PROACTIVE.get("enabled", True))
+PROACTIVE_COOLDOWN_S = float(_PROACTIVE.get("global_cooldown_seconds", 300.0))
+PROACTIVE_DEDUP_S = float(_PROACTIVE.get("dedup_window_seconds", 600.0))
+PROACTIVE_MAX_PER_WINDOW = int(_PROACTIVE.get("max_interactions_per_window", 3))
+PROACTIVE_WINDOW_S = float(_PROACTIVE.get("window_seconds", 3600.0))
+PROACTIVE_CONFIDENCE_THRESHOLD = float(_PROACTIVE.get("confidence_threshold", 0.5))
+PROACTIVE_MIN_REPEAT = int(_PROACTIVE.get("min_repeat_observations", 2))
+PROACTIVE_QUIET_ENABLED = bool(_PROACTIVE_QUIET.get("enabled", False))
+PROACTIVE_QUIET_START = int(_PROACTIVE_QUIET.get("start_hour", 22))
+PROACTIVE_QUIET_END = int(_PROACTIVE_QUIET.get("end_hour", 8))
+
 # Logging Settings (Phase 8)
 LOG_FILE = DATA_DIR / "jarvis.log"
 LOG_MAX_BYTES = int(CONFIG.get("logging", {}).get("max_bytes", 1_000_000))  # 1 MB

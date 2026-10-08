@@ -512,6 +512,38 @@ class VoiceLoop:
         except Exception:  # noqa: BLE001
             self.machine.transition(State.IDLE, reason="turn settled", force=True)
 
+    def check_proactive(self, candidate=None, *, user_speaking=False,
+                        wake_active=False) -> object:
+        """Decision-only proactive hook: candidate -> gates -> YES/NO.
+
+        The candidate arrives as data (built by the caller from the
+        ObservationEngine); this method never reads the camera itself, so the
+        Phase 4 invariant holds: perception cannot move the state machine, only a
+        wake word or speech can. Speaks nothing and touches no audio: on YES
+        the caller drives the existing Brain and the existing :meth:`_speak`,
+        so barge-in, stale-turn drops and the machine stay authoritative.
+        """
+        from jarvis.proactive import (
+            ContextSnapshot,
+            get_orchestrator,
+            get_proactive_engine,
+        )
+
+        if candidate is None:
+            return None
+        state = self.machine.state
+        snap = ContextSnapshot(
+            user_availability="unavailable" if state in INTERRUPTABLE
+            else "probably_available",
+            active_conversation=state is not State.IDLE,
+            user_speaking=bool(user_speaking),
+            assistant_speaking=state is State.SPEAKING,
+            wake_active=bool(wake_active),
+            recently_spoken=get_orchestrator().recent_reasons(),
+        )
+        result = get_proactive_engine().decide(candidate, snap)
+        return result if result.should_speak else None
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------

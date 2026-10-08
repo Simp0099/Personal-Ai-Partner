@@ -344,6 +344,17 @@ async def conversation_state():
     loop = get_voice_loop()
     machine = loop.machine if loop is not None else _state_machine()
 
+    # Proactive state (Phase 6): ephemeral continuity only. No reasoning,
+    # no frames, no memory contents — just whether proactive speech is
+    # currently allowed and why the last candidate was held back.
+    try:
+        from jarvis.config import PROACTIVE_ENABLED
+        from jarvis.proactive import get_orchestrator
+        _proactive_status = get_orchestrator().status()
+        _proactive_status["enabled"] = bool(PROACTIVE_ENABLED)
+    except Exception:  # noqa: BLE001 - diagnostics must never break /api/state
+        _proactive_status = {"enabled": False, "error": "unavailable"}
+
     return {
         **machine.snapshot(),
         "voice": loop.status() if loop is not None else {
@@ -356,6 +367,7 @@ async def conversation_state():
         # no prompts, nothing the model was told.
         "conversation_state": get_tone().status(),
         "visual_context": get_visual_context().status(),
+        "proactive": _proactive_status,
     }
 
 

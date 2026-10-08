@@ -367,6 +367,54 @@ conversation_state:
     half_life_seconds: 300   # temporary state relaxes back to defaults
 
 # ============================================================================
+# Proactive Partner (Phase 6)
+# ============================================================================
+# When JARVIS may initiate conversation. All gates are conservative by default.
+# The default answer is NO — most observations result in silence.
+proactive:
+  enabled: true
+
+  # Global cooldown in seconds after any proactive interaction.
+  # Prevents repeated speech on the same event.
+  global_cooldown_seconds: 300
+
+  # Per-reason cooldown overrides (seconds). Same reason won't trigger again
+  # within this window.
+  per_reason_cooldown_seconds: {}
+
+  # Maximum proactive interactions per rolling window.
+  max_interactions_per_window: 3
+  window_seconds: 3600  # rolling window for the limit above
+
+  # Availability gates
+  require_available: true
+  probably_available_evidence:
+    - "recent user interaction"
+    - "explicit user request"
+    - "no active conversation"
+    - "cooldown expired"
+
+  # Deduplication
+  dedup_window_seconds: 600  # same reason won't trigger twice within this window
+
+  # Quiet hours — when proactive is suppressed regardless of other gates
+  quiet_hours:
+    enabled: false
+    start_hour: 22   # 10 PM
+    end_hour: 8      # 8 AM
+
+  # Confidence threshold for a candidate to even be considered
+  confidence_threshold: 0.5
+
+  # Observation gating
+  require_persistence: true  # one-frame observations are not meaningful
+  min_repeat_observations: 2  # consecutive meaningful readings before candidacy
+
+  # Style/tone integration
+  tone_influence: true  # Phase 5 tone influences proactive wording
+  style_hint_weight: 0.3  # how much tone shapes (0.0-1.0), never overrides
+
+# ============================================================================
 # Vision / Perception (Phase 3)
 # ============================================================================
 # Images you attach are always analysed — there is nothing to enable for that.
