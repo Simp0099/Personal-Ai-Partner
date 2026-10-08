@@ -257,7 +257,7 @@ def run_text_mode() -> None:
             print(f"[Error]: {e.message}")
         except Exception as e:
             logger.error(f"Error in text mode: {e}", exc_info=True)
-            print(f"[Error]: {e}")
+            print("[Error]: I encountered an issue processing that command, Boss.")
 
     stop_voice()
     stop_perception()

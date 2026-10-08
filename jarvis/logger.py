@@ -25,6 +25,65 @@ def _get_config_value(key: str, default=None):
         return default
 
 
+# Console verbosity for the "jarvis" logger. Normal mode keeps the terminal
+# to user-facing print() output only; diagnostics always go to the rotating
+# file. --debug lowers the console handler to DEBUG via configure_logging().
+# Nothing in the codebase logs above ERROR, so CRITICAL silences the console
+# without detaching the handler (keeps handler identity stable for tests).
+_CONSOLE_QUIET_LEVEL = logging.CRITICAL
+_CONSOLE_DEBUG_LEVEL = logging.DEBUG
+
+_DEBUG = False
+
+
+def debug_mode() -> bool:
+    """True when --debug opened console diagnostics for this process."""
+    return _DEBUG
+
+
+class _LiveStdout:
+    """Stream proxy that resolves sys.stdout on every write.
+
+    The console handler is created once per process, but test runners and
+    hosts may swap sys.stdout (pytest capture, daemonization). A proxy keeps
+    console diagnostics following the live stdout without rebinding, and can
+    never dangle on a closed capture object.
+    """
+
+    def write(self, data):
+        return sys.stdout.write(data)
+
+    def flush(self):
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _console_handler(logger: logging.Logger):
+    """The stdout StreamHandler, or None. File handlers never match."""
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, RotatingFileHandler
+        ):
+            return handler
+    return None
+
+
+def _file_handler(logger: logging.Logger):
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            return handler
+    return None
+
+
+def _formatter() -> logging.Formatter:
+    return logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
 def _setup_logger() -> logging.Logger:
     """Configure and return the JARVIS logger with rotating file handler.
 
@@ -36,25 +95,21 @@ def _setup_logger() -> logging.Logger:
     log_file = _get_config_value("LOG_FILE", data_dir / "jarvis.log")
     log_max_bytes = _get_config_value("LOG_MAX_BYTES", 1_000_000)
     log_backup_count = _get_config_value("LOG_BACKUP_COUNT", 3)
-    log_level = _get_config_value("LOG_LEVEL", "INFO")
 
     logger = logging.getLogger("jarvis")
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    # Capture everything; the handlers gate where it surfaces. The file
+    # always receives DEBUG+; the console level is owned by configure_logging().
+    logger.setLevel(logging.DEBUG)
 
     # Prevent duplicate handlers if module is reloaded
     if logger.handlers:
         return logger
 
-    # Format
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
+    # Console handler: quiet by default (normal mode shows user-facing
+    # print() output only). configure_logging(debug=True) opens it.
+    console_handler = logging.StreamHandler(_LiveStdout())
+    console_handler.setLevel(_CONSOLE_QUIET_LEVEL)
+    console_handler.setFormatter(_formatter())
     logger.addHandler(console_handler)
 
     # Rotating file handler
@@ -68,10 +123,57 @@ def _setup_logger() -> logging.Logger:
             encoding="utf-8",
         )
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(_formatter())
         logger.addHandler(file_handler)
     except Exception as e:
         logger.warning(f"Could not create log file: {e}")
+
+    return logger
+
+
+def configure_logging(debug: bool = False, log_file=None) -> logging.Logger:
+    """Set console verbosity; never duplicates handlers.
+
+    Normal mode (debug=False): console stays silent, file keeps DEBUG+.
+    Debug mode (debug=True): console shows DEBUG+ alongside the file.
+    Optional log_file redirects the file handler (tests use a tmp path).
+    Idempotent: repeated calls reuse the same two handlers.
+    """
+    global _DEBUG
+    _DEBUG = bool(debug)
+
+    logger = logging.getLogger("jarvis")
+    logger.setLevel(logging.DEBUG)
+
+    console = _console_handler(logger)
+    if console is None:
+        console = logging.StreamHandler(_LiveStdout())
+        console.setFormatter(_formatter())
+        logger.addHandler(console)
+    console.setLevel(_CONSOLE_DEBUG_LEVEL if _DEBUG else _CONSOLE_QUIET_LEVEL)
+
+    if log_file is not None:
+        target = str(log_file)
+        current = _file_handler(logger)
+        if current is not None and getattr(current, "baseFilename", None) == target:
+            pass
+        else:
+            if current is not None:
+                logger.removeHandler(current)
+                try:
+                    current.close()
+                except Exception:
+                    pass
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            replacement = RotatingFileHandler(
+                target, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            replacement.setLevel(logging.DEBUG)
+            replacement.setFormatter(_formatter())
+            logger.addHandler(replacement)
+    elif _file_handler(logger) is None:
+        _setup_logger()
 
     return logger
 

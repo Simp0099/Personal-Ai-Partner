@@ -204,7 +204,19 @@ def main():
     parser.add_argument("--test", action="store_true", help="Run integration tests")
     parser.add_argument("--no-wake", action="store_true", help="Voice mode without wake word")
     parser.add_argument("--status", action="store_true", help="Show system status")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show internal diagnostic logs on the terminal "
+                             "(normal mode keeps user-facing output only)")
     args = parser.parse_args()
+
+    # Phase 1: terminal shows user-facing output only unless --debug opens
+    # console diagnostics. The log file always receives full diagnostics.
+    # --debug also enables the (logging-only) routing/model debug lines.
+    from jarvis.logger import configure_logging
+    configure_logging(debug=args.debug)
+    if args.debug:
+        import jarvis.brain as _brain_mod
+        _brain_mod.DEBUG_INPUT = True
 
     if args.status:
         show_status()
