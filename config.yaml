@@ -281,6 +281,19 @@ debug:
 weather:
   default_city: "Delhi"
 
+# ============================================================================
+# Local applications (Phase 3) — safe application launching
+# ============================================================================
+# Only applications listed here may be launched by the local launch handler
+# (`open -a` via argument-list subprocess, never a shell). Matching is
+# case-insensitive; anything else is rejected locally with no provider call.
+# Default deny: an empty or missing list means nothing is launchable.
+applications:
+  allowed: []
+  # Examples (uncomment to enable):
+  # - WhatsApp
+  # - Safari
+
 contacts:
   # Email contact aliases
   # mom: "example_mom@gmail.com"

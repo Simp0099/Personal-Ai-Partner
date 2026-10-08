@@ -32,6 +32,7 @@ _INTENT_TOOLS = {
     "dictionary": "lookup_dictionary",
     "weather": "get_temperature",
     "screenshot": "take_screenshot",
+    "launch_app": "launch_app",
     "media_play": "play_music",
 }
 

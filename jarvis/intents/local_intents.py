@@ -44,11 +44,19 @@ def handle_media_play(dispatch: Callable[[str, dict], str], song: str) -> str:
     return dispatch("play_music", {"song_name": song})
 
 
+def handle_launch_app(dispatch: Callable[[str, dict], str], app_name: str) -> str:
+    # The registered wrapper enforces the allowlist and safe execution,
+    # and already returns a full user-facing sentence for every outcome
+    # (launched, not approved, not installed, invalid). All local, no LLM.
+    return dispatch("launch_app", {"app_name": app_name})
+
+
 _HANDLERS = {
     "time": lambda dispatch, args: handle_time(dispatch),
     "dictionary": lambda dispatch, args: handle_dictionary(dispatch, args["word"]),
     "weather": lambda dispatch, args: handle_weather(dispatch, args.get("city", "")),
     "screenshot": lambda dispatch, args: handle_screenshot(dispatch),
+    "launch_app": lambda dispatch, args: handle_launch_app(dispatch, args["app_name"]),
     "media_play": lambda dispatch, args: handle_media_play(dispatch, args["song"]),
 }
 

@@ -176,6 +176,24 @@ DEFAULT_MAPS_QUERY = CONFIG.get("locations", {}).get("default_maps_query", "Delh
 # Contacts Map
 CONTACTS = CONFIG.get("contacts", {}) or {}
 
+
+def _validated_app_allowlist(raw) -> list:
+    """Allowlist entries must be non-empty strings; deduped, order kept."""
+    if not isinstance(raw, list):
+        return []
+    seen = []
+    for entry in raw:
+        if isinstance(entry, str) and entry.strip() and entry not in seen:
+            seen.append(entry)
+    return seen
+
+
+# Local application launching (Phase 3). Default deny: missing, empty, or
+# malformed means nothing is launchable through the local handler.
+ALLOWED_APPS = _validated_app_allowlist(
+    (CONFIG.get("applications", {}) or {}).get("allowed", [])
+)
+
 # Speech & TTS Settings
 # Chatterbox is the active engine. Paths are relative to PROJECT_ROOT (the repo
 # root, i.e. the Model/ directory) unless absolute.

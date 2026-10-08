@@ -104,6 +104,22 @@ def match_screenshot(text: str) -> Optional[IntentMatch]:
     return None
 
 
+_LAUNCH = re.compile(r"^(open|launch|start)\s+(?P<app>.{1,80})$",
+                     re.IGNORECASE)
+
+
+def match_launch_app(text: str) -> Optional[IntentMatch]:
+    """Launch command with a free-text app name. Safety lives in the
+    allowlist, not here: anything not allowlisted is rejected locally."""
+    found = _LAUNCH.match(text.strip())
+    if not found:
+        return None
+    app = " ".join(found.group("app").strip().split())
+    if not app or len(app) > 80:
+        return None
+    return IntentMatch(intent="launch_app", args={"app_name": app})
+
+
 _PLAY = re.compile(r"^play\s+(?P<song>.{3,100})$")
 # Bare generics carry no track: let the LLM path ask which song, as today.
 _GENERIC_SONGS = {"music", "song", "songs", "something", "anything", "it"}
@@ -119,12 +135,11 @@ def match_media(text: str) -> Optional[IntentMatch]:
     return IntentMatch(intent="media_play", args={"song": song})
 
 
-# NOTE: launch_app and volume are intentionally absent. Phase 0 verified the
-# repository has no existing launcher or volume tool, and inventing OS-level
-# implementations here would bypass the Phase 3 safety design. Those
-# utterances fall through to the existing AI router until real tools exist.
+# NOTE: volume is intentionally absent. Phase 0 verified the repository has
+# no existing volume tool, and inventing OS-level implementations here is out
+# of scope. Such utterances fall through to the existing AI router.
 _MATCHERS = (match_time, match_dictionary, match_weather, match_screenshot,
-             match_media)
+             match_launch_app, match_media)
 
 
 def match(text: str) -> Optional[IntentMatch]:

@@ -42,6 +42,7 @@ from jarvis.tools import (
     weather,
     general,
     system_tools,
+    apps,
 )
 from jarvis import behavior
 from jarvis import memory
@@ -227,6 +228,15 @@ def open_website(service_or_url: str) -> str:
         service_or_url: The name of the service or direct URL to open.
     """
     return web.open_service(service_or_url)
+
+
+def launch_app(app_name: str) -> str:
+    """Launch an allowlisted macOS application (Phase 3: allowlist + no shell).
+
+    Args:
+        app_name: Application name as allowlisted (e.g. WhatsApp, Safari).
+    """
+    return apps.launch_app(app_name)
 
 
 def search_youtube(query: str) -> str:
@@ -475,6 +485,7 @@ def recall_memories(query: str = "") -> str:
 GEMINI_TOOLS = [
     search_wikipedia,
     open_website,
+    launch_app,
     search_youtube,
     search_google,
     open_maps,
@@ -508,6 +519,7 @@ NON_IDEMPOTENT_TOOLS = frozenset({
     "send_email",
     "play_music",
     "open_website",
+    "launch_app",
     "open_maps",
     "take_screenshot",
     "save_memory",

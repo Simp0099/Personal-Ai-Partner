@@ -114,10 +114,16 @@ class TestPatterns:
         "take a screenshot and email it to mom",
         "what time is it, and tell me a joke",
         "play", "define", "play music",
-        "open WhatsApp", "turn the volume up", "",
+        "turn the volume up", "",
     ])
     def test_no_match_falls_through(self, text):
         assert match_only(text) is None
+
+    @pytest.mark.parametrize("text", [
+        "open WhatsApp", "Open whatsapp", "launch Safari", "Start Safari",
+    ])
+    def test_launch_app_matches(self, text):
+        assert match_only(text) == "launch_app"
 
 
 # ============================================================================
