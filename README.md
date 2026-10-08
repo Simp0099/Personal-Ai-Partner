@@ -21,6 +21,7 @@ Welcome to **JARVIS 2.0**, an AI companion upgraded from a monolithic keyword-ma
 - [x] **Phase 0.5: Provider-Agnostic Model Layer** (see below)
 - [x] **Phase 3: Vision, Webcam & Perception** (image vision + opt-in webcam perception)
 - [x] **Phase 4: Wake Word, Conversation State & Interruption** (see below)
+- [x] **Phase 5: Conversation State** (mood, energy, warmth, curiosity, mode)
 
 ## Model Layer (Phase 0.5)
 
@@ -188,6 +189,50 @@ python3 scripts/phase4_live_check.py   # real mic, real speakers, real model
 ```
 
 Checks needing a human to speak are reported SKIPPED rather than assumed.
+
+## Conversation State (Phase 5)
+
+How JARVIS is talking *right now*, as a dynamic layer around a personality that
+does not move.
+
+```text
+PERSONALITY        = who JARVIS is          (identity prompt, stable)
+CONVERSATION STATE = how JARVIS talks now   (this, decays)
+MEMORY             = what JARVIS may keep   (explicit requests only)
+VISUAL CONTEXT     = what JARVIS can see    (ephemeral)
+```
+
+```yaml
+conversation_state:
+  enabled: true
+  defaults: { mood: neutral, conversation_mode: casual,
+              energy: 0.55, warmth: 0.75, curiosity: 0.60 }
+  decay:    { enabled: true, half_life_seconds: 300 }
+```
+
+The same sentence gets a different reply depending on the state — "It finally
+works" is met differently when the conversation is celebratory than when it is
+technical. The reasoning is identical; only the expression changes.
+
+Four properties make it honest:
+
+- **No second model.** State is derived from deterministic keyword signals on
+  text the Brain already has. 10,000 updates cost 0.19s and no network.
+- **Conservative inference.** `user_emotional_state` comes only from what the
+  user said about themselves. Absence of evidence is `unknown`, not a guess, and
+  an explicit "I'm not frustrated" withdraws the inference.
+- **A soft signal.** The state shapes style and is told, in the prompt itself,
+  that it never overrides accuracy, instructions, safety or tool requirements.
+- **Structurally blind to the camera.** `jarvis/tone.py` imports nothing that
+  can see, so no pixel can ever become an emotion.
+
+It is ephemeral by construction: nothing here writes to memory, and it is never
+offered a memory tool. The voice path uses it for exactly one thing — the
+expressiveness parameter Chatterbox already exposes.
+
+```bash
+python3 scripts/phase5_live_check.py   # real model, real turns
+```
 
 ## Getting Started
 

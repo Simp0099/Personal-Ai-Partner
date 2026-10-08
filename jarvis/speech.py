@@ -147,8 +147,12 @@ def _get_chatterbox_model():
     return model
 
 
-def _synthesize_chatterbox(text: str):
+def _synthesize_chatterbox(text: str, exaggeration=None):
     """Generate speech with Chatterbox, cloning the configured reference voice.
+
+    `exaggeration` overrides `speech.chatterbox_exaggeration` for this one call.
+    It is the only expressiveness control the engine exposes, so Phase 5 uses it
+    as a hint and nothing more; omitting it keeps the configured default.
 
     The resolved reference path is passed straight to `generate()` as
     `audio_prompt_path`, so the voice identity always comes from the configured
@@ -169,7 +173,8 @@ def _synthesize_chatterbox(text: str):
         wav = model.generate(
             text,
             audio_prompt_path=str(reference),
-            exaggeration=CHATTERBOX_EXAGGERATION,
+            exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
+                          else float(exaggeration)),
             cfg_weight=CHATTERBOX_CFG_WEIGHT,
             temperature=CHATTERBOX_TEMPERATURE,
         )

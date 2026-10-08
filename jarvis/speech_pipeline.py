@@ -38,11 +38,16 @@ class ASRUnavailable(RuntimeError):
 # Synthesis
 # ---------------------------------------------------------------------------
 
-def _chatterbox_synthesize(text: str) -> Any:
-    """Reuse the existing Chatterbox engine. Returns a mono float32 array."""
+def _chatterbox_synthesize(text: str, exaggeration=None) -> Any:
+    """Reuse the existing Chatterbox engine. Returns a mono float32 array.
+
+    `exaggeration` is passed straight through to the engine when supplied and
+    left alone when not, so the default voice is byte-for-byte what it was
+    before Phase 5.
+    """
     from jarvis import speech
 
-    return speech._synthesize_chatterbox(text)
+    return speech._synthesize_chatterbox(text, exaggeration=exaggeration)
 
 
 def _sounddevice_play(data: bytes, sample_rate: int = SAMPLE_RATE) -> None:
@@ -86,6 +91,7 @@ class SpeechPlayer:
         chunk_ms: int = TTS_CHUNK_MS,
         sample_rate: int = SAMPLE_RATE,
         on_play: Optional[Callable[[bytes], None]] = None,
+        exaggeration: Optional[float] = None,
     ):
         self.queue = queue if queue is not None else AudioQueue()
         self.synthesize = synthesize or _chatterbox_synthesize
@@ -96,6 +102,9 @@ class SpeechPlayer:
         #: Called with each chunk immediately before it is played, so the echo
         #: canceller knows exactly what the speakers are about to emit.
         self.on_play = on_play
+        #: Optional per-reply expressiveness hint, bounded by the engine's own
+        #: configured range. None means "use the configured default".
+        self.exaggeration = exaggeration
 
         self._thread: Optional[threading.Thread] = None
         self._cancel = threading.Event()
@@ -114,7 +123,7 @@ class SpeechPlayer:
         """
         if not (text or "").strip():
             return 0
-        audio = self.synthesize(text)
+        audio = _synthesize_with(self.synthesize, text, self.exaggeration)
         data = _to_pcm16(audio, self.sample_rate)
         queued = 0
         for chunk in _split(data, self.sample_rate, self.chunk_ms):
@@ -190,6 +199,20 @@ class SpeechPlayer:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         self._thread = None
+
+
+def _synthesize_with(synthesize, text: str, exaggeration) -> Any:
+    """Call a synthesizer that may or may not accept an expressiveness hint.
+
+    Injected synthesizers in tests take only the text, so the hint is passed
+    only when the callable can actually receive it.
+    """
+    if exaggeration is None:
+        return synthesize(text)
+    try:
+        return synthesize(text, exaggeration=exaggeration)
+    except TypeError:
+        return synthesize(text)
 
 
 def _to_pcm16(audio: Any, sample_rate: int = SAMPLE_RATE) -> bytes:

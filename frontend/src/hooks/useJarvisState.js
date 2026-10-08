@@ -58,6 +58,7 @@ export function useJarvisState() {
     turn_id: null,
     transcript: '',
     voice: { running: false, wake_enabled: false },
+    conversation_state: null,
     webcam_running: false,
     visual_context: { observations: [], fresh: false },
     last_error: null,

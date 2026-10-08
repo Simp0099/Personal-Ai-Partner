@@ -347,6 +347,26 @@ conversation:
   # input_device: 1          # microphone index; omit for the system default
 
 # ============================================================================
+# Conversation state (Phase 5) -- how JARVIS is talking right now
+# ============================================================================
+# Personality ("who JARVIS is") is the identity prompt and is not configured
+# here. This is the dynamic layer around it: the tone of the current
+# conversation. It decays, and it is never written to memory.
+conversation_state:
+  enabled: true
+
+  defaults:
+    mood: neutral
+    conversation_mode: casual
+    energy: 0.55
+    warmth: 0.75
+    curiosity: 0.60
+
+  decay:
+    enabled: true
+    half_life_seconds: 300   # temporary state relaxes back to defaults
+
+# ============================================================================
 # Vision / Perception (Phase 3)
 # ============================================================================
 # Images you attach are always analysed — there is nothing to enable for that.

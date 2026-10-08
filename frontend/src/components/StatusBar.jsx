@@ -23,12 +23,30 @@ const STATE_LABELS = {
   error: 'Error',
 }
 
+/**
+ * Phase 5: the conversational tone is shown as application state -- how the
+ * assistant is currently choosing to talk. It is deliberately labelled as a tone
+ * setting rather than a mood, because that is what it is.
+ */
+const MODE_LABELS = {
+  casual: 'Casual',
+  focused: 'Focused',
+  technical: 'Technical',
+  supportive: 'Supportive',
+  playful: 'Playful',
+  celebratory: 'Celebrating',
+  serious: 'Serious',
+  brainstorming: 'Exploring',
+  task_execution: 'Working',
+}
+
 export default function StatusBar({
   isConnected,
   isListening,
   isSpeaking,
   isVoiceActive = false,
   assistantState = 'idle',
+  conversationState = null,
   latency,
 }) {
   const [displayLatency, setDisplayLatency] = useState(latency ?? 0)
@@ -103,6 +121,21 @@ export default function StatusBar({
             {isSpeaking ? 'Speaking' : 'Muted'}
           </span>
         </div>
+
+        {/* Conversational tone (Phase 5) */}
+        {conversationState?.conversation_mode && (
+          <div className="indicator tone-indicator">
+            <span
+              style={{
+                ...styles.indicatorText,
+                color: 'var(--color-info)',
+              }}
+            >
+              Tone: {MODE_LABELS[conversationState.conversation_mode]
+                ?? conversationState.conversation_mode}
+            </span>
+          </div>
+        )}
 
         {/* Latency — hidden on mobile */}
         <div style={styles.indicator} className="latency-indicator">

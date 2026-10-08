@@ -45,6 +45,7 @@ from jarvis.tools import (
 )
 from jarvis import behavior
 from jarvis import memory
+from jarvis import tone
 from jarvis import vision
 from jarvis.logger import logger, StatusIndicator
 from jarvis.model_layer import (
@@ -126,6 +127,15 @@ def _build_context_block(
     """
     parts = []
 
+    # Fold this message into the conversational state first, so the guidance
+    # below describes the conversation the user just had. Perception turns never
+    # reach here (see `_ask_locked`), so a camera observation can never move the
+    # user's mood.
+    try:
+        tone.observe(message)
+    except Exception as e:  # noqa: BLE001 - tone must never break a turn
+        logger.warning(f"Conversation state skipped: {e}")
+
     try:
         # Query on the current message plus recent turns: "keep going" is only
         # resolvable if the last few turns are part of the query.
@@ -167,6 +177,15 @@ def _build_context_block(
     )
     if directive:
         parts.append("\n\n## This turn\n" + directive)
+
+    # Dynamic layer around the personality, never a replacement for it. Empty
+    # for a neutral conversation, so the common case costs nothing. Guarded like
+    # every other optional context piece: a broken tone renderer must not cost
+    # the user their answer.
+    try:
+        parts.append(tone.format_prompt())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Conversation state guidance skipped: {e}")
 
     if images:
         parts.append("\n\n" + behavior.vision_directive(len(images)))
@@ -616,6 +635,10 @@ class JarvisBrain:
         self._turn_context = ""
         self._ephemeral = False
         self._message_count = 0
+        # A clean slate is a new conversation, so the conversational state goes
+        # with the history rather than describing a conversation that no longer
+        # exists.
+        tone.reset_tone()
 
     def _record(self, *messages: Dict[str, Any]) -> None:
         """Append neutral turns to the conversation history."""
@@ -735,15 +758,19 @@ class JarvisBrain:
         # Serialize turns so rapid messages cannot interleave or reorder.
         with self._lock:
             self._ephemeral = ephemeral
-            # An ephemeral turn borrows these two flags for its duration and
-            # hands them back: the conversation's own turn context must not be
-            # left holding a camera directive for the next history rebuild.
-            saved_context = self._turn_context
+            # Only an ephemeral turn borrows the turn context. It has to hand it
+            # back, or the conversation's next history rebuild would open a
+            # session carrying a camera directive. A normal turn must NOT be
+            # restored: a later trim rebuilds the session from this turn's
+            # context, so clearing it here left those rebuilds working from a
+            # stale or empty prompt.
+            saved_context = self._turn_context if ephemeral else None
             try:
                 return self._ask_locked(message, images, ephemeral=ephemeral)
             finally:
                 self._ephemeral = False
-                self._turn_context = saved_context
+                if ephemeral:
+                    self._turn_context = saved_context
 
     def _ask_locked(
         self,

@@ -39,6 +39,7 @@ from jarvis.config import (
     WAKE_WORD_THRESHOLD,
 )
 from jarvis.conversation import ConversationMachine, State
+from jarvis.tone import get_tone
 from jarvis.logger import logger, StatusIndicator
 from jarvis.speech_pipeline import ASRUnavailable, SpeechPlayer, Transcriber
 from jarvis.wake_word import WakeWordEngine
@@ -434,6 +435,12 @@ class VoiceLoop:
         """Synthesize and play, checking staleness between chunks."""
         self.machine.transition(State.SPEAKING, reason="reply ready")
         is_stale = self.machine.is_stale
+
+        # The conversational state only reaches the voice through the one
+        # expressiveness control Chatterbox actually exposes. It is a hint, not
+        # a mode: the same engine, same voice, same reference audio.
+        state = get_tone().state
+        self.player.exaggeration = state.exaggerated() or None
 
         queued = self.player.synthesize_to_queue(reply, turn_id, is_stale)
         if is_stale(turn_id) or queued == 0:

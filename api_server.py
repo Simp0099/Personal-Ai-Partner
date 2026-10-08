@@ -336,6 +336,7 @@ async def conversation_state():
 
     Read-only. Nothing here starts the microphone.
     """
+    from jarvis.tone import get_tone
     from jarvis.vision import get_visual_context
     from jarvis.webcam import get_webcam_perception
     from jarvis.voice_loop import get_voice_loop
@@ -351,6 +352,9 @@ async def conversation_state():
             "note": "Voice input is not running; text conversation is unaffected.",
         },
         "webcam_running": bool(get_webcam_perception() and get_webcam_perception().is_running()),
+        # Application state, not a claim about inner experience. No reasoning,
+        # no prompts, nothing the model was told.
+        "conversation_state": get_tone().status(),
         "visual_context": get_visual_context().status(),
     }
 

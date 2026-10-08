@@ -208,6 +208,31 @@ KOKORO_SPEED = float(_SPEECH.get("kokoro_speed", 1.0))
 PYTTSX3_RATE = int(_SPEECH.get("pyttsx3_rate", 180))
 
 # ---------------------------------------------------------------------------
+# Conversation state (Phase 5) -- how JARVIS is talking right now
+# ---------------------------------------------------------------------------
+# Personality ("who JARVIS is") stays in JARVIS_SYSTEM_PROMPT and is untouched.
+# This is the dynamic layer around it: mood, energy, warmth, curiosity, the mode
+# of the conversation, and what the user said about themselves.
+#
+# Nothing here is written to memory. A mood is not a fact about a person.
+_TONE = CONFIG.get("conversation_state", {}) or {}
+_TONE_DEFAULTS = _TONE.get("defaults", {}) or {}
+_TONE_DECAY = _TONE.get("decay", {}) or {}
+
+TONE_ENABLED = bool(_TONE.get("enabled", True))
+
+TONE_MOOD_DEFAULT = str(_TONE_DEFAULTS.get("mood", "neutral"))
+TONE_MODE_DEFAULT = str(_TONE_DEFAULTS.get("conversation_mode", "casual"))
+TONE_ENERGY_DEFAULT = float(_TONE_DEFAULTS.get("energy", 0.55))
+TONE_WARMTH_DEFAULT = float(_TONE_DEFAULTS.get("warmth", 0.75))
+TONE_CURIOUSITY_DEFAULT = float(_TONE_DEFAULTS.get("curiosity", 0.60))
+
+# Temporary emotional state relaxes back toward the defaults on this half-life.
+# Computed lazily on read, so an idle assistant spends nothing on it.
+TONE_DECAY_ENABLED = bool(_TONE_DECAY.get("enabled", True))
+TONE_DECAY_HALF_LIFE = float(_TONE_DECAY.get("half_life_seconds", 300.0))
+
+# ---------------------------------------------------------------------------
 # Vision / Perception (Phase 3)
 # ---------------------------------------------------------------------------
 # Two independent visual inputs share one perception layer:

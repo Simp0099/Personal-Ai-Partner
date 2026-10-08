@@ -28,6 +28,7 @@ export default function App() {
     latency,
     isThinking,
     isVoiceActive,
+    backendState,
     sendMessage,
     interrupt,
     toggleVoice,
@@ -42,6 +43,7 @@ export default function App() {
         isSpeaking={isSpeaking}
         isVoiceActive={isVoiceActive}
         assistantState={assistantState}
+        conversationState={backendState.conversation_state}
         latency={latency}
       />
 
