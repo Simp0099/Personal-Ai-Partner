@@ -38,7 +38,11 @@ from jarvis.config import (
     WAKE_WORD_ENABLED,
     WAKE_WORD_THRESHOLD,
 )
-from jarvis.conversation import ConversationMachine, State
+from jarvis.conversation import (
+    AssistantStateMachine,
+    ConversationMachine,
+    State,
+)
 from jarvis.tone import get_tone
 from jarvis.logger import logger, StatusIndicator
 from jarvis.speech_pipeline import ASRUnavailable, SpeechPlayer, Transcriber
@@ -57,6 +61,7 @@ class VoiceLoop:
         brain: Any = None,
         *,
         machine: Optional[ConversationMachine] = None,
+        assistant: Optional[AssistantStateMachine] = None,
         microphone: Optional[MicrophoneStream] = None,
         vad: Optional[VoiceActivityDetector] = None,
         echo: Optional[EchoGuard] = None,
@@ -74,6 +79,8 @@ class VoiceLoop:
         Args:
             brain: Used for its default `ask` when `respond` is not supplied.
             machine: Authoritative state. One is created if omitted.
+            assistant: Optional 4-state lifecycle mirror. When given, every
+                detailed transition is projected onto it (never raises).
             microphone: The single audio owner. One is created if omitted.
             player: Cancellable speech output.
             respond: Given a transcript, returns the reply text. Injectable so
@@ -118,6 +125,9 @@ class VoiceLoop:
 
         # Subscribe once so every transition reaches the HUD event list.
         self.machine.subscribe(self._forward_event)
+        self._assistant = assistant
+        if assistant is not None:
+            self.machine.subscribe(self._mirror_lifecycle)
 
     # ------------------------------------------------------------------
     # Events
@@ -131,6 +141,14 @@ class VoiceLoop:
                 listener(payload)
             except Exception:  # noqa: BLE001 - a bad observer cannot break the loop
                 pass
+
+    def _mirror_lifecycle(self, event) -> None:
+        """Project detailed voice states onto the 4-state lifecycle view."""
+        try:
+            if self._assistant is not None:
+                self._assistant.observe(event.state, reason="voice loop")
+        except Exception:  # noqa: BLE001 - mirror never breaks the driver
+            pass
 
     def add_event_listener(self, listener: Callable[[Dict[str, Any]], None]) -> None:
         with self._lock:

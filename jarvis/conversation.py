@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from jarvis.logger import logger
+
 
 class State(str, Enum):
     """Every state Ai Partner can be in.
@@ -368,11 +370,134 @@ class StateEvent:
         }
 
 
+# ============================================================================
+# Phase 7 — assistant lifecycle (4-state view over the detailed machine)
+# ============================================================================
+# The detailed ConversationMachine stays authoritative for voice internals.
+# This layer coordinates the cross-mode lifecycle (voice + text loops) in the
+# four states the assistant can be observed in. It never owns audio, models,
+# or TTS lifetime: IDLE means "no active request", not "unload anything".
+
+
+class AssistantState(str, Enum):
+    """Observable assistant lifecycle. Values are the log wire format."""
+
+    IDLE = "idle"
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    SPEAKING = "speaking"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
+
+
+#: Allowed lifecycle edges. Barge-in is real architecture (INTERRUPTABLE
+#: voice states, echo guard), so PROCESSING/SPEAKING may return to LISTENING
+#: when the user takes the floor; everything else follows the normal
+#: IDLE -> LISTENING -> PROCESSING -> SPEAKING -> IDLE chain plus
+#: cancellation/error recovery to IDLE.
+_LIFECYCLE_ALLOWED: Dict[AssistantState, Set[AssistantState]] = {
+    AssistantState.IDLE: {AssistantState.LISTENING},
+    AssistantState.LISTENING: {AssistantState.PROCESSING, AssistantState.IDLE},
+    AssistantState.PROCESSING: {AssistantState.SPEAKING, AssistantState.IDLE,
+                                AssistantState.LISTENING},
+    AssistantState.SPEAKING: {AssistantState.IDLE, AssistantState.LISTENING},
+}
+
+
+def detailed_to_lifecycle(state: State) -> AssistantState:
+    """Project a detailed conversation state onto the 4-state lifecycle."""
+    if state is State.LISTENING:
+        return AssistantState.LISTENING
+    if state in (State.TRANSCRIBING, State.THINKING):
+        return AssistantState.PROCESSING
+    if state is State.SPEAKING:
+        return AssistantState.SPEAKING
+    return AssistantState.IDLE
+
+
+class AssistantStateMachine:
+    """Single authoritative coordinator for the observable assistant lifecycle.
+
+    Thread-safe (RLock), atomic transitions, DEBUG-only logging. Holds no
+    resources: no audio, no model, no TTS handle -- so IDLE can never unload
+    anything. One instance is shared process-wide via
+    :func:`get_assistant_machine`; tests construct their own.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._state = AssistantState.IDLE
+
+    @property
+    def state(self) -> AssistantState:
+        with self._lock:
+            return self._state
+
+    def transition_to(self, state: AssistantState, reason: str = "") -> bool:
+        """Move to `state`. Same-state is a no-op success; illegal edges raise
+        :class:`InvalidTransition` and leave state untouched. Reasons must be
+        fixed lifecycle phrases, never user content."""
+        with self._lock:
+            previous = self._state
+            if state is previous:
+                return True
+            if state not in _LIFECYCLE_ALLOWED[previous]:
+                raise InvalidTransition(
+                    f"cannot go {previous.value} -> {state.value}"
+                    + (f" ({reason})" if reason else "")
+                )
+            self._state = state
+        logger.debug(f"assistant lifecycle: {previous.value} -> {state.value}"
+                     + (f" ({reason})" if reason else ""))
+        return True
+
+    def observe(self, detailed: State, reason: str = "") -> bool:
+        """Mirror a detailed-machine transition. Never raises: a derived view
+        must not break its driver; impossible projections are logged + skipped."""
+        target = detailed_to_lifecycle(detailed)
+        try:
+            return self.transition_to(target, reason or f"observed {detailed.value}")
+        except InvalidTransition as e:
+            logger.debug(f"assistant lifecycle: skipped {e}")
+            return False
+
+    def recover(self, reason: str = "recovered") -> bool:
+        """Force IDLE after a failure or cancellation. Always succeeds."""
+        with self._lock:
+            previous = self._state
+            self._state = AssistantState.IDLE
+        if previous is not AssistantState.IDLE:
+            logger.debug(f"assistant lifecycle: {previous.value} -> idle ({reason})")
+        return True
+
+    def reset(self) -> None:
+        """Return to IDLE. Used on shutdown."""
+        self.recover("reset")
+
+
+_assistant_machine: Optional[AssistantStateMachine] = None
+_assistant_lock = threading.Lock()
+
+
+def get_assistant_machine() -> AssistantStateMachine:
+    """Process-wide lifecycle coordinator. One assistant, one lifecycle."""
+    global _assistant_machine
+    with _assistant_lock:
+        if _assistant_machine is None:
+            _assistant_machine = AssistantStateMachine()
+        return _assistant_machine
+
+
 __all__ = [
+    "AssistantState",
+    "AssistantStateMachine",
     "ConversationMachine",
     "InvalidTransition",
     "STAGES",
     "State",
     "StateEvent",
     "Turn",
+    "detailed_to_lifecycle",
+    "get_assistant_machine",
 ]

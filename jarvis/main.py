@@ -19,11 +19,18 @@ Usage:
 import sys
 import random
 import datetime
+import threading
 from jarvis.config import ASSISTANT_NAME, GREETING_NAME, LLM_MODEL
 from jarvis.speech import speak, listen, set_interactive_prompting
 from jarvis.brain import JarvisBrain, BrainError
 import jarvis.brain as jarvis_brain
 from jarvis.logger import logger, StatusIndicator
+from jarvis.conversation import (
+    AssistantState,
+    AssistantStateMachine,
+    InvalidTransition,
+    get_assistant_machine,
+)
 
 # Phrases that mean "shut down". Matched against the whole normalized utterance
 # only. The previous substring check ("exit" in query) terminated the process on
@@ -38,6 +45,19 @@ SHUTDOWN_PHRASES = frozenset({
     "goodbye",
     "bye",
 })
+
+
+def _to(machine: AssistantStateMachine, state: AssistantState, reason: str) -> None:
+    """Drive the lifecycle, self-healing if a previous turn left it elsewhere.
+
+    The lifecycle layer must never crash a user turn: on an illegal edge,
+    recover to IDLE first, then take the requested edge.
+    """
+    try:
+        machine.transition_to(state, reason)
+    except InvalidTransition:
+        machine.recover(f"healed before {reason}")
+        machine.transition_to(state, reason)
 
 
 def is_shutdown_request(query: str) -> bool:
@@ -124,9 +144,11 @@ def run_assistant() -> None:
     brain = JarvisBrain()
     start_perception(brain)
     voice = start_voice(brain)
+    machine = get_assistant_machine()
 
     try:
         while True:
+            _to(machine, AssistantState.LISTENING, "awaiting input")
             query = listen().strip()
 
             if not query or query.lower() == "none":
@@ -136,18 +158,24 @@ def run_assistant() -> None:
             if is_shutdown_request(query):
                 StatusIndicator.shutdown()
                 speak(f"Going offline. You can call me anytime, {GREETING_NAME}!")
+                machine.recover("shutdown")
                 break
 
             # Process through Gemini LLM Brain
+            _to(machine, AssistantState.PROCESSING, "request accepted")
             try:
                 response = brain.ask(query)
+                _to(machine, AssistantState.SPEAKING, "response ready")
                 speak(response)
+                machine.transition_to(AssistantState.IDLE, "turn complete")
             except BrainError as e:
                 logger.error(f"Model unavailable: {e.detail or e}")
                 speak(e.message)
+                machine.recover("provider failure")
             except Exception as e:
                 logger.error(f"Error processing query: {e}", exc_info=True)
                 speak("I encountered an issue processing that command, Boss.")
+                machine.recover("processing error")
     finally:
         stop_voice()
         stop_perception()
@@ -163,29 +191,41 @@ def run_wake_word_mode() -> None:
 
     set_interactive_prompting(True)
     brain = JarvisBrain()
+    shutdown_requested = threading.Event()
 
     def on_wake():
         """Called when wake word is detected."""
+        machine = get_assistant_machine()
+        _to(machine, AssistantState.SPEAKING, "wake acknowledged")
         speak("Yes, Boss?")
+        _to(machine, AssistantState.LISTENING, "awaiting input")
         query = listen().strip()
 
         if not query or query.lower() == "none":
+            machine.recover("no input")
             return
 
         if is_shutdown_request(query):
             StatusIndicator.shutdown()
             speak(f"Going offline. You can call me anytime, {GREETING_NAME}!")
-            sys.exit(0)
+            machine.recover("shutdown")
+            shutdown_requested.set()
+            return
 
+        _to(machine, AssistantState.PROCESSING, "request accepted")
         try:
             response = brain.ask(query)
+            _to(machine, AssistantState.SPEAKING, "response ready")
             speak(response)
+            machine.transition_to(AssistantState.IDLE, "turn complete")
         except BrainError as e:
             logger.error(f"Model unavailable: {e.detail or e}")
             speak(e.message)
+            machine.recover("provider failure")
         except Exception as e:
             logger.error(f"Error processing wake command: {e}", exc_info=True)
             speak("I encountered an issue processing that command, Boss.")
+            machine.recover("processing error")
 
     print(f"\n{'='*60}")
     print(f"  {ASSISTANT_NAME} 2.0 — Wake Word Mode")
@@ -234,12 +274,15 @@ def run_text_mode() -> None:
     brain = JarvisBrain()
     start_perception(brain)
     start_voice(brain)
+    machine = get_assistant_machine()
 
     while True:
+        _to(machine, AssistantState.LISTENING, "awaiting input")
         try:
             user_input = input("You> ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{GREETING_NAME}, signing off. Goodbye!")
+            machine.recover("input closed")
             break
 
         if not user_input:
@@ -247,17 +290,23 @@ def run_text_mode() -> None:
 
         if is_shutdown_request(user_input):
             print(f"\n{ASSISTANT_NAME}: Going offline. You can call me anytime, {GREETING_NAME}!")
+            machine.recover("shutdown")
             break
 
+        _to(machine, AssistantState.PROCESSING, "request accepted")
         try:
             response = brain.ask(user_input)
+            _to(machine, AssistantState.SPEAKING, "response ready")
             print(f"\n{ASSISTANT_NAME}: {response}\n")
+            machine.transition_to(AssistantState.IDLE, "turn complete")
         except BrainError as e:
             logger.error(f"Model unavailable: {e.detail or e}")
             print(f"[Error]: {e.message}")
+            machine.recover("provider failure")
         except Exception as e:
             logger.error(f"Error in text mode: {e}", exc_info=True)
             print("[Error]: I encountered an issue processing that command, Boss.")
+            machine.recover("processing error")
 
     stop_voice()
     stop_perception()
