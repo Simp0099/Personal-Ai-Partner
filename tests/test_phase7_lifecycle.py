@@ -12,6 +12,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Pre-import torch (when present) OUTSIDE any mock block. The TTS test below
+# uses patch.dict(sys.modules, ...) which evicts every module imported inside
+# the block on exit -- re-executing torch's native init segfaults. Importing
+# it once here keeps it resident (same convention as test_tts_chatterbox.py).
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
