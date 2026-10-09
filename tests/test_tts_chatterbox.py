@@ -36,8 +36,12 @@ from jarvis.config import CHATTERBOX_REFERENCE_AUDIO, TTS_ENGINE  # noqa: E402
 def _reset_chatterbox_cache():
     """Keep the module-level model cache from leaking between tests."""
     speech._chatterbox_model = None
+    speech._chatterbox_conds_key = None
+    speech._chatterbox_warmed = False
     yield
     speech._chatterbox_model = None
+    speech._chatterbox_conds_key = None
+    speech._chatterbox_warmed = False
 
 
 def _fake_model():
@@ -183,24 +187,32 @@ class TestSynthesis:
     """6. Synthesis calls. 7. Audio format matches the playback layer."""
 
     def test_resolved_reference_reaches_chatterbox_generate(self):
-        """The approved WAV must be the actual `audio_prompt_path` argument."""
+        """The approved WAV is prepared once; generations reuse it (Phase 6).
+
+        Per-call `audio_prompt_path` was the old contract: the library
+        re-preprocessed the reference on every request. The service now
+        prepares conditionals once and generates without the argument.
+        """
         model = _fake_model()
         with patch.object(speech, "_get_chatterbox_model", return_value=model):
             speech._synthesize_chatterbox("Hello. I am online.")
 
-        prompt = model.generate.call_args.kwargs["audio_prompt_path"]
-        assert prompt == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
-        assert Path(prompt).is_file()
-        assert Path(prompt).samefile(PROJECT_ROOT / "chatterbox_emotion_test.wav")
+        model.prepare_conditionals.assert_called_once()
+        prepared = model.prepare_conditionals.call_args[0][0]
+        assert prepared == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
+        assert Path(prepared).is_file()
+        for call in model.generate.call_args_list:
+            assert "audio_prompt_path" not in call.kwargs
 
     def test_every_request_uses_the_approved_reference(self):
-        """Repeated speech never drifts onto another voice file."""
+        """Repeated speech prepares once and never drifts voices (Phase 6)."""
         model = _fake_model()
         with patch.object(speech, "_get_chatterbox_model", return_value=model):
             for _ in range(3):
                 speech._synthesize_chatterbox("Hello.")
-        prompts = [c.kwargs["audio_prompt_path"] for c in model.generate.call_args_list]
-        assert prompts == [str(PROJECT_ROOT / "chatterbox_emotion_test.wav")] * 3
+        assert model.prepare_conditionals.call_count == 1
+        prepared = model.prepare_conditionals.call_args[0][0]
+        assert prepared == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
 
     def test_voice_parameters_are_unchanged(self):
         """This task locks the reference, not the synthesis parameters."""
@@ -241,15 +253,15 @@ class TestSynthesis:
         assert model.sr == 24000
 
     def test_playback_reaches_sounddevice_from_a_real_reference(self):
-        """End-to-end seam: assistant text -> generate(ref) -> sd.play."""
+        """End-to-end seam: assistant text -> prepared ref -> sd.play."""
         model = _fake_model()
         sd = MagicMock()
         with patch.dict(sys.modules, {"sounddevice": sd}):
             with patch.object(speech, "_get_chatterbox_model", return_value=model):
                 speech.speak("Hey Boss... I'm here. What are we doing?")
 
-        prompt = model.generate.call_args.kwargs["audio_prompt_path"]
-        assert prompt == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
+        prepared = model.prepare_conditionals.call_args[0][0]
+        assert prepared == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
         sd.play.assert_called_once()
         sd.wait.assert_called_once()
 

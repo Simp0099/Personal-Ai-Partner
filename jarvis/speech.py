@@ -1,9 +1,9 @@
 """Speech input and output management for JARVIS 2.0.
 
 Provides cross-platform text-to-speech (TTS) and speech-to-text (STT) capabilities.
-The active TTS engine is Chatterbox: the model loads once and every synthesis call
-passes the approved reference voice (`chatterbox_emotion_test.wav`, resolved
-relative to the project root) to Chatterbox as `audio_prompt_path`.
+The active TTS engine is Chatterbox: the model loads once, the reference voice
+(`chatterbox_emotion_test.wav`, resolved relative to the project root) is
+prepared once into reusable conditionals, and every synthesis call reuses them.
 pyttsx3 and console output remain available as explicit, configured fallbacks.
 
 Kokoro is retained as a legacy engine only (speech.tts_engine: "kokoro").
@@ -12,6 +12,7 @@ Phase 8: All errors caught and logged. Status indicators for CLI visibility.
 """
 
 import sys
+import threading
 from pathlib import Path
 
 from jarvis.config import (
@@ -33,6 +34,10 @@ from jarvis.logger import logger, StatusIndicator
 
 # Lazy-loaded audio components
 _chatterbox_model = None  # loaded once, reused for every request
+_chatterbox_lock = threading.RLock()  # serializes init + inference
+_chatterbox_conds_key = None  # str(ref path) whose conditionals are prepared
+_chatterbox_warmed = False  # one controlled warm-up per process
+_CHATTERBOX_WARMUP_TEXT = "Yes, Boss?"
 _pyttsx3_engine = None
 _kokoro_pipeline = None
 _kokoro_available = None  # None = not yet attempted, True/False = result
@@ -109,8 +114,8 @@ def _get_chatterbox_model():
     """Load the Chatterbox model once and reuse it for every request.
 
     The model itself (weights + tokenizer) is the expensive part, so it is cached
-    at module scope. The reference voice is passed per request via
-    `audio_prompt_path` in `_synthesize_chatterbox`.
+    at module scope under a lock (double-checked). Reference-voice conditionals
+    are prepared separately by `prepare_chatterbox_reference`, not here.
 
     Returns:
         A ready-to-use `ChatterboxTTS` instance.
@@ -120,31 +125,121 @@ def _get_chatterbox_model():
             initialize, or the reference audio is missing.
     """
     global _chatterbox_model
-    if _chatterbox_model is not None:
-        return _chatterbox_model
+    with _chatterbox_lock:
+        if _chatterbox_model is not None:
+            return _chatterbox_model
 
-    # Resolve (and validate) the reference voice before spending time on weights.
+        # Resolve (and validate) the reference voice before spending time on weights.
+        reference = _resolve_chatterbox_reference()
+
+        try:
+            from chatterbox.tts import ChatterboxTTS
+        except ImportError as e:
+            raise TTSEngineError(
+                "Chatterbox TTS is not installed. Install it with "
+                "`pip install chatterbox-tts` in the project environment."
+            ) from e
+
+        device = _chatterbox_device()
+        logger.info(
+            f"Initializing Chatterbox TTS (device: {device}, reference: {reference.name})..."
+        )
+        try:
+            model = ChatterboxTTS.from_pretrained(device=device)
+        except Exception as e:
+            raise TTSEngineError(f"Chatterbox model failed to initialize: {e}") from e
+
+        _chatterbox_model = model
+        return model
+
+
+def prepare_chatterbox_reference(model=None, exaggeration=None) -> float:
+    """Prepare voice conditionals once per reference file; return elapsed ms.
+
+    The installed API (`prepare_conditionals`) does the expensive deterministic
+    work -- wav load, resample, embeddings. After this, `generate()` runs
+    without `audio_prompt_path` and reuses `model.conds`. Per-call
+    exaggeration differences are handled by the library's cheap emotion-only
+    update inside `generate()`. Returns 0.0 when the cache is reused.
+    Falls back to per-call preparation when the model predates the API.
+    """
     reference = _resolve_chatterbox_reference()
+    model = model if model is not None else _get_chatterbox_model()
+    key = str(reference)
+    with _chatterbox_lock:
+        global _chatterbox_conds_key
+        if _chatterbox_conds_key == key:
+            return 0.0
+        prepare = getattr(model, "prepare_conditionals", None)
+        if prepare is None:
+            logger.debug("Chatterbox model lacks prepare_conditionals; "
+                         "reference will be passed per request.")
+            return 0.0
+        import time
+        start = time.perf_counter_ns()
+        prepare(str(reference),
+                exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
+                              else float(exaggeration)))
+        elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+        _chatterbox_conds_key = key
+        logger.info(f"Chatterbox reference prepared ({reference.name}) "
+                    f"in {elapsed_ms:.0f} ms.")
+        return elapsed_ms
 
-    try:
-        from chatterbox.tts import ChatterboxTTS
-    except ImportError as e:
-        raise TTSEngineError(
-            "Chatterbox TTS is not installed. Install it with "
-            "`pip install chatterbox-tts` in the project environment."
-        ) from e
 
-    device = _chatterbox_device()
-    logger.info(
-        f"Initializing Chatterbox TTS (device: {device}, reference: {reference.name})..."
-    )
-    try:
-        model = ChatterboxTTS.from_pretrained(device=device)
-    except Exception as e:
-        raise TTSEngineError(f"Chatterbox model failed to initialize: {e}") from e
+def warm_up_chatterbox(model=None) -> float:
+    """One controlled warm-up through the real inference path; ms, 0.0 if done.
 
-    _chatterbox_model = model
+    Lazy like the rest of TTS: the cost lands on first use, where Phase 5
+    measured no latency benefit -- this exercises the path and surfaces
+    failures early, it does not claim a speedup. Best-effort: a failed
+    warm-up is logged and retried next call, never blocking real synthesis.
+    """
+    with _chatterbox_lock:
+        global _chatterbox_warmed
+        if _chatterbox_warmed:
+            return 0.0
+        model = model if model is not None else _get_chatterbox_model()
+        import time
+        start = time.perf_counter_ns()
+        try:
+            with _inference_context():
+                model.generate(
+                    _CHATTERBOX_WARMUP_TEXT,
+                    exaggeration=CHATTERBOX_EXAGGERATION,
+                    cfg_weight=CHATTERBOX_CFG_WEIGHT,
+                    temperature=CHATTERBOX_TEMPERATURE,
+                )
+        except Exception as e:  # noqa: BLE001 -- synthesis still attempted below
+            logger.warning(f"Chatterbox warm-up failed, will retry: {e}")
+            return 0.0
+        elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+        _chatterbox_warmed = True
+        logger.info(f"Chatterbox warm-up completed in {elapsed_ms:.0f} ms.")
+        return elapsed_ms
+
+
+def ensure_chatterbox_ready() -> object:
+    """Load model, prepare reference, warm up -- each exactly once."""
+    model = _get_chatterbox_model()
+    prepare_chatterbox_reference(model)
+    warm_up_chatterbox(model)
     return model
+
+
+def _inference_context():
+    """Inference-mode context where torch exists, else a no-op.
+
+    The installed Chatterbox already runs its inference under
+    `torch.inference_mode()`; this guards our boundary too without
+    making torch an import-time dependency of the speech module.
+    """
+    try:
+        import torch
+    except ImportError:
+        import contextlib
+        return contextlib.nullcontext()
+    return torch.inference_mode()
 
 
 def _synthesize_chatterbox(text: str, exaggeration=None):
@@ -154,9 +249,9 @@ def _synthesize_chatterbox(text: str, exaggeration=None):
     It is the only expressiveness control the engine exposes, so Phase 5 uses it
     as a hint and nothing more; omitting it keeps the configured default.
 
-    The resolved reference path is passed straight to `generate()` as
-    `audio_prompt_path`, so the voice identity always comes from the configured
-    file (`Model/chatterbox_emotion_test.wav` by default).
+    The resolved reference path is prepared once per process (see
+    `prepare_chatterbox_reference`); per-request `generate()` calls reuse the
+    cached conditionals and only carry the lightweight synthesis parameters.
 
     Args:
         text: The text to synthesize.
@@ -168,16 +263,16 @@ def _synthesize_chatterbox(text: str, exaggeration=None):
         TTSEngineError: on any engine failure.
     """
     reference = _resolve_chatterbox_reference()
-    model = _get_chatterbox_model()
+    model = ensure_chatterbox_ready()
     try:
-        wav = model.generate(
-            text,
-            audio_prompt_path=str(reference),
-            exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
-                          else float(exaggeration)),
-            cfg_weight=CHATTERBOX_CFG_WEIGHT,
-            temperature=CHATTERBOX_TEMPERATURE,
-        )
+        with _chatterbox_lock, _inference_context():
+            wav = model.generate(
+                text,
+                exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
+                              else float(exaggeration)),
+                cfg_weight=CHATTERBOX_CFG_WEIGHT,
+                temperature=CHATTERBOX_TEMPERATURE,
+            )
     except Exception as e:
         raise TTSEngineError(
             f"Chatterbox synthesis failed with reference {reference.name}: {e}"
