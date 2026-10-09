@@ -29,6 +29,7 @@ from jarvis.config import (
     KOKORO_LANG,
     KOKORO_SPEED,
     PYTTSX3_RATE,
+    SAY_VOICE,
 )
 from jarvis.logger import logger, StatusIndicator
 from jarvis.trace import span_of
@@ -410,11 +411,93 @@ def _speak_pyttsx3(text: str) -> bool:
         return False
 
 
+#: Sample rate the voice pipeline consumes (SpeechPlayer chunks at this rate).
+SAY_TARGET_RATE = 16000
+
+
+def _synthesize_say(text: str) -> "np.ndarray":
+    """Render speech with macOS `say` into a 16 kHz mono float32 array.
+
+    Fast local engine for interactive responses (~1 s per short reply vs
+    ~1 min for Chatterbox). No model to load, no downloads, no network.
+    The voice is the configured system voice, NOT the Chatterbox clone.
+    Raises TTSEngineError when `say` is missing or rendering fails.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    import numpy as np
+
+    if not (text or "").strip():
+        raise TTSEngineError("Nothing to speak.")
+    fd, path = tempfile.mkstemp(prefix="jarvis-say-", suffix=".aiff")
+    os.close(fd)
+    try:
+        # No persistent model: always ready (no tts_ready span by design).
+        with span_of("tts_generate"):
+            try:
+                subprocess.run(
+                    ["say", "-v", SAY_VOICE, "-o", path, text],
+                    check=True, capture_output=True, timeout=120,
+                )
+            except FileNotFoundError as e:
+                raise TTSEngineError(f"macOS `say` not found: {e}") from e
+            except subprocess.CalledProcessError as e:
+                raise TTSEngineError(f"`say` failed (rc={e.returncode})") from e
+            try:
+                import soundfile as sf
+                data, rate = sf.read(path, dtype="float32", always_2d=True)
+            except Exception as e:
+                raise TTSEngineError(f"Could not read `say` output: {e}") from e
+        mono = np.asarray(data, dtype=np.float32).mean(axis=1)
+        if rate != SAY_TARGET_RATE:  # linear resample; measurement-grade
+            idx = np.linspace(0, len(mono) - 1, int(len(mono) * SAY_TARGET_RATE / rate))
+            mono = np.interp(idx, np.arange(len(mono)), mono).astype(np.float32)
+        return np.asarray(mono, dtype=np.float32).reshape(-1)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def synthesize_for_engine(text: str, exaggeration=None):
+    """Synthesize with the configured engine for array-returning pipelines.
+
+    `say` is rendered locally; anything else keeps the existing Chatterbox
+    path (today's effective voice-mode behavior for legacy engines).
+    """
+    if TTS_ENGINE == "say":
+        return _synthesize_say(text)
+    return _synthesize_chatterbox(text, exaggeration=exaggeration)
+
+
+def _speak_say(text: str) -> bool:
+    """Speak with macOS `say` through the speaker. Returns True on success."""
+    try:
+        try:
+            import sounddevice as sd
+        except ImportError as e:
+            raise TTSEngineError(
+                "sounddevice is not installed. Install it with `pip install sounddevice`."
+            ) from e
+
+        audio = _synthesize_say(text)
+        sd.play(audio, SAY_TARGET_RATE)
+        sd.wait()
+        return True
+    except TTSEngineError as e:
+        logger.error(f"say speech error: {e}")
+        return False
+
+
 def speak(text: str) -> None:
     """Output speech to console and audio speakers.
 
-    Priority: the configured engine (Chatterbox by default) -> the explicitly
-    configured `speech.chatterbox_fallback_engine` -> console text only.
+    Priority: the configured engine ("say" by default for interactive speed,
+    "chatterbox" for the cloned voice when explicitly selected) -> the
+    explicitly configured fallback -> console text only.
     Chatterbox never silently reverts to Kokoro.
 
     Args:
@@ -427,7 +510,10 @@ def speak(text: str) -> None:
     print(f"\n[JARVIS]: {text}")
 
     # Primary engine
-    if TTS_ENGINE == "chatterbox":
+    if TTS_ENGINE == "say":
+        if _speak_say(text):
+            return
+    elif TTS_ENGINE == "chatterbox":
         if _speak_chatterbox(text):
             return
         if CHATTERBOX_FALLBACK_ENGINE == "pyttsx3" and _speak_pyttsx3(text):

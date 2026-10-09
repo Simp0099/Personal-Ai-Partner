@@ -304,9 +304,13 @@ locations:
   default_maps_query: "Delhi"
 
 speech:
-  # TTS Engine: "chatterbox" (active, voice-cloned from a reference WAV),
-  # "kokoro" (legacy) or "pyttsx3" (basic platform TTS)
-  tts_engine: "chatterbox"
+  # TTS Engine: "say" (default, fast macOS voice for interactive responses),
+  # "chatterbox" (voice-cloned from a reference WAV, slow -- opt-in),
+  # "kokoro" (legacy) or "pyttsx3" (basic platform TTS).
+  # Trade-off: "say" uses a system voice (say_voice), NOT the Chatterbox
+  # clone. Choose "chatterbox" when voice identity matters more than latency.
+  tts_engine: "say"
+  say_voice: "Samantha"      # macOS voice for the "say" engine (see `say -v '?'`)
   # Chatterbox voice identity. Path relative to the project root (this repo's
   # Model/ directory); an absolute path also works.
   chatterbox_reference_audio: "chatterbox_emotion_test.wav"

@@ -53,6 +53,8 @@ no second process: `python -m jarvis` runs the whole assistant.
 - Single-microphone pipeline: wake word, VAD, and STT share one stream
 - Barge-in/interruption handling with echo suppression
 - Chatterbox neural TTS cloned from `chatterbox_emotion_test.wav`
+  (opt-in via `speech.tts_engine: "chatterbox"`; default is the fast local
+  `say` voice for interactive latency -- see `docs/tts_latency_optimization.md`)
 
 ### Intelligence
 - Provider-agnostic model layer (`jarvis/providers/`, `jarvis/model_layer.py`)

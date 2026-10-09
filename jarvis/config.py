@@ -199,7 +199,11 @@ ALLOWED_APPS = _validated_app_allowlist(
 # root, i.e. the Model/ directory) unless absolute.
 _SPEECH = CONFIG.get("speech", {}) or {}
 
-TTS_ENGINE = _SPEECH.get("tts_engine", "chatterbox")
+TTS_ENGINE = _SPEECH.get("tts_engine", "say")
+
+# macOS `say`: fast local engine, default for interactive responses. The voice
+# is a system voice (not the Chatterbox clone) -- documented trade-off.
+SAY_VOICE = str(_SPEECH.get("say_voice", "Samantha") or "Samantha")
 
 # Chatterbox: voice identity comes from the reference WAV, not from a voice id.
 CHATTERBOX_REFERENCE_AUDIO = _SPEECH.get("chatterbox_reference_audio", "chatterbox_emotion_test.wav")

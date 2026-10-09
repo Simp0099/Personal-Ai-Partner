@@ -38,16 +38,16 @@ class ASRUnavailable(RuntimeError):
 # Synthesis
 # ---------------------------------------------------------------------------
 
-def _chatterbox_synthesize(text: str, exaggeration=None) -> Any:
-    """Reuse the existing Chatterbox engine. Returns a mono float32 array.
+def _engine_synthesize(text: str, exaggeration=None) -> Any:
+    """Synthesize with the configured engine, resolved at call time.
 
-    `exaggeration` is passed straight through to the engine when supplied and
-    left alone when not, so the default voice is byte-for-byte what it was
-    before Phase 5.
+    Honors `speech.tts_engine` as of each call (not import), so engine
+    switches and tests take effect without rebuilding the player. Anything
+    but `say` keeps the existing Chatterbox path.
     """
     from jarvis import speech
 
-    return speech._synthesize_chatterbox(text, exaggeration=exaggeration)
+    return speech.synthesize_for_engine(text, exaggeration=exaggeration)
 
 
 def _sounddevice_play(data: bytes, sample_rate: int = SAMPLE_RATE) -> None:
@@ -94,7 +94,7 @@ class SpeechPlayer:
         exaggeration: Optional[float] = None,
     ):
         self.queue = queue if queue is not None else AudioQueue()
-        self.synthesize = synthesize or _chatterbox_synthesize
+        self.synthesize = synthesize or _engine_synthesize
         self.play = play or _sounddevice_play
         self.stop_playback = stop_playback or _sounddevice_stop
         self.chunk_ms = int(chunk_ms)

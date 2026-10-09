@@ -53,10 +53,12 @@ def _fake_model():
 
 
 class TestChatterboxConfiguration:
-    """1. Chatterbox is the active/default engine."""
+    """1. Chatterbox remains available as the opt-in cloned-voice engine."""
 
-    def test_chatterbox_is_default_engine(self):
-        assert TTS_ENGINE == "chatterbox"
+    def test_chatterbox_is_selectable_not_default(self):
+        # Default moved to "say" for interactive latency (measured ~1 s vs
+        # ~60 s warm Chatterbox). Chatterbox stays fully configured.
+        assert TTS_ENGINE == "say"
 
     def test_reference_audio_points_at_emotion_test_wav(self):
         assert CHATTERBOX_REFERENCE_AUDIO == "chatterbox_emotion_test.wav"
@@ -258,7 +260,8 @@ class TestSynthesis:
         sd = MagicMock()
         with patch.dict(sys.modules, {"sounddevice": sd}):
             with patch.object(speech, "_get_chatterbox_model", return_value=model):
-                speech.speak("Hey Boss... I'm here. What are we doing?")
+                with patch.object(speech, "TTS_ENGINE", "chatterbox"):
+                    speech.speak("Hey Boss... I'm here. What are we doing?")
 
         prepared = model.prepare_conditionals.call_args[0][0]
         assert prepared == str(PROJECT_ROOT / "chatterbox_emotion_test.wav")
