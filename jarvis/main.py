@@ -234,20 +234,20 @@ def run_wake_word_mode() -> None:
     print(f"\nSay 'hey jarvis' to activate. Type Ctrl+C to exit.\n")
 
     listener = WakeWordListener(on_wake=on_wake)
-    listener.start()
     start_perception(brain)
     voice = start_voice(brain)
 
     try:
-        # Keep main thread alive while listener runs in background
-        while listener.is_listening():
-            import time
-            time.sleep(0.5)
+        # Detection clears is_listening before its callback starts. Join the
+        # worker through TTS and audio cleanup, then arm the next wake.
+        while not shutdown_requested.is_set():
+            listener.start()
+            listener.join()
     except KeyboardInterrupt:
         logger.info("Session ended by user.")
-        listener.stop()
         sys.exit(0)
     finally:
+        listener.stop()
         # Release audio and camera before the process goes down. Freeing a
         # native handle while another thread still holds it is exactly what the
         # previous shutdown race looked like.

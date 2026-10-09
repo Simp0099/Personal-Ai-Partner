@@ -181,6 +181,9 @@ class WakeWordListener:
         self.engine = WakeWordEngine(model=model, threshold=threshold)
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        #: Serializes start() so repeated calls can never spawn duplicate
+        #: workers, including while a previous worker is still releasing audio.
+        self._start_lock = threading.Lock()
 
     # Kept for backwards compatibility with existing callers and tests.
     @property
@@ -214,10 +217,16 @@ class WakeWordListener:
         Phase 8/4: All errors caught and logged gracefully, and the audio
         device is released on *every* exit path, including wake.
         """
-        import numpy as np
-        import pyaudio
+        try:
+            import numpy as np
+            import pyaudio
+        except Exception as e:
+            self._running = False
+            logger.error(f"Wake word audio dependencies unavailable: {e}", exc_info=True)
+            return
 
         if not self._init_engine():
+            self._running = False
             return
 
         CHUNK = 1280  # 80ms at 16kHz — small chunks for low latency
@@ -271,15 +280,24 @@ class WakeWordListener:
                     audio.terminate()
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"PyAudio terminate reported: {e}")
+            self._running = False
 
     def start(self):
-        """Start listening for the wake word in a background thread."""
-        if self._running:
-            return
+        """Start listening for the wake word in a background thread.
 
-        self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._thread.start()
+        Idempotent: at most one worker exists. A call while the previous
+        worker is still releasing audio returns without spawning, so two
+        streams are never open at once -- call `join()` first to re-arm.
+        """
+        with self._start_lock:
+            if self._running:
+                return
+            if self._thread is not None and self._thread.is_alive():
+                return
+
+            self._running = True
+            self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self._thread.start()
 
     def stop(self):
         """Stop the wake word listener."""
@@ -288,6 +306,11 @@ class WakeWordListener:
             self._thread.join(timeout=2)
         self._thread = None
         self.close()
+
+    def join(self) -> None:
+        """Wait until the current wake callback and audio cleanup finish."""
+        if self._thread is not None:
+            self._thread.join()
 
     def is_listening(self) -> bool:
         """Check if the listener is currently active."""
