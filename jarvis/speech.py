@@ -31,6 +31,7 @@ from jarvis.config import (
     PYTTSX3_RATE,
 )
 from jarvis.logger import logger, StatusIndicator
+from jarvis.trace import span_of
 
 # Lazy-loaded audio components
 _chatterbox_model = None  # loaded once, reused for every request
@@ -263,16 +264,18 @@ def _synthesize_chatterbox(text: str, exaggeration=None):
         TTSEngineError: on any engine failure.
     """
     reference = _resolve_chatterbox_reference()
-    model = ensure_chatterbox_ready()
+    with span_of("tts_ready"):
+        model = ensure_chatterbox_ready()
     try:
         with _chatterbox_lock, _inference_context():
-            wav = model.generate(
-                text,
-                exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
-                              else float(exaggeration)),
-                cfg_weight=CHATTERBOX_CFG_WEIGHT,
-                temperature=CHATTERBOX_TEMPERATURE,
-            )
+            with span_of("tts_generate"):
+                wav = model.generate(
+                    text,
+                    exaggeration=(CHATTERBOX_EXAGGERATION if exaggeration is None
+                                  else float(exaggeration)),
+                    cfg_weight=CHATTERBOX_CFG_WEIGHT,
+                    temperature=CHATTERBOX_TEMPERATURE,
+                )
     except Exception as e:
         raise TTSEngineError(
             f"Chatterbox synthesis failed with reference {reference.name}: {e}"

@@ -49,6 +49,7 @@ from jarvis import memory
 from jarvis import tone
 from jarvis import vision
 from jarvis.logger import logger, StatusIndicator
+from jarvis.trace import current_trace, new_trace, span_of, use_trace
 from jarvis.model_layer import (
     ModelLayer,
     ModelSpec,
@@ -782,35 +783,54 @@ class JarvisBrain:
             )
 
         # Serialize turns so rapid messages cannot interleave or reorder.
-        with self._lock:
-            self._ephemeral = ephemeral
-            # Phase 2: deterministic local intents run before any provider
-            # call. A match executes an existing registry tool with zero LLM
-            # involvement; no match falls through to the AI router unchanged.
-            # Ephemeral (perception) and image turns never match: a camera
-            # frame is an analysis request, not a user command.
-            if not ephemeral and not images:
-                local_response = self._try_local_intent(message)
-                if local_response is not None:
-                    self._trim_history()
-                    self._record(
-                        {"role": "user", "content": message},
-                        {"role": "assistant", "content": local_response},
-                    )
-                    return local_response
-            # Only an ephemeral turn borrows the turn context. It has to hand it
-            # back, or the conversation's next history rebuild would open a
-            # session carrying a camera directive. A normal turn must NOT be
-            # restored: a later trim rebuilds the session from this turn's
-            # context, so clearing it here left those rebuilds working from a
-            # stale or empty prompt.
-            saved_context = self._turn_context if ephemeral else None
+        # One trace per turn: reuse an enclosing trace (voice loop) or own one.
+        trace = current_trace()
+        own_trace = trace is None
+        if own_trace:
+            trace = new_trace()
+        with use_trace(trace):
             try:
-                return self._ask_locked(message, images, ephemeral=ephemeral)
+                with self._lock:
+                    self._ephemeral = ephemeral
+                    # Phase 2: deterministic local intents run before any provider
+                    # call. A match executes an existing registry tool with zero LLM
+                    # involvement; no match falls through to the AI router unchanged.
+                    # Ephemeral (perception) and image turns never match: a camera
+                    # frame is an analysis request, not a user command.
+                    if not ephemeral and not images:
+                        with span_of("intent_route"):
+                            local_response = self._try_local_intent(message)
+                        if local_response is not None:
+                            self._trim_history()
+                            self._record(
+                                {"role": "user", "content": message},
+                                {"role": "assistant", "content": local_response},
+                            )
+                            trace.route = "local"
+                            return local_response
+                    # Only an ephemeral turn borrows the turn context. It has to hand it
+                    # back, or the conversation's next history rebuild would open a
+                    # session carrying a camera directive. A normal turn must NOT be
+                    # restored: a later trim rebuilds the session from this turn's
+                    # context, so clearing it here left those rebuilds working from a
+                    # stale or empty prompt.
+                    saved_context = self._turn_context if ephemeral else None
+                    try:
+                        return self._ask_locked(message, images, ephemeral=ephemeral)
+                    finally:
+                        self._ephemeral = False
+                        if ephemeral:
+                            self._turn_context = saved_context
             finally:
-                self._ephemeral = False
-                if ephemeral:
-                    self._turn_context = saved_context
+                # Single finish point: local hits set route above, provider
+                # turns are recognized by their request spans. Voice-owned
+                # traces are finished by the voice loop, not here.
+                if not trace.route:
+                    names = {s.name for s in trace.spans}
+                    trace.route = ("provider" if "provider_request" in names
+                                   else "unserved")
+                if own_trace:
+                    trace.finish()
 
     def _ask_locked(
         self,
@@ -825,18 +845,19 @@ class JarvisBrain:
 
         self._trim_history()
 
-        classification = self.layer.classify(
-            message,
-            conversation_tokens=estimate_tokens(self._history),
-            tools_available=bool(GEMINI_TOOLS) and not ephemeral,
-            # Vision is required if *this* turn carries an image OR an earlier
-            # turn in the conversation did. History is replayed to whichever
-            # model serves this turn, so a text-only model would be handed the
-            # conversation's images too -- which providers reject outright
-            # ("No endpoints found that support image input"), failing the turn
-            # with a non-retryable error instead of falling back.
-            vision_required=bool(images) or self._history_has_images(),
-        )
+        with span_of("classify"):
+            classification = self.layer.classify(
+                message,
+                conversation_tokens=estimate_tokens(self._history),
+                tools_available=bool(GEMINI_TOOLS) and not ephemeral,
+                # Vision is required if *this* turn carries an image OR an earlier
+                # turn in the conversation did. History is replayed to whichever
+                # model serves this turn, so a text-only model would be handed the
+                # conversation's images too -- which providers reject outright
+                # ("No endpoints found that support image input"), failing the turn
+                # with a non-retryable error instead of falling back.
+                vision_required=bool(images) or self._history_has_images(),
+            )
         context_tokens = estimate_tokens(self._history) + estimate_tokens([
             {"content": message, "images": images}
         ])
@@ -897,7 +918,9 @@ class JarvisBrain:
                 payload = {"kind": "user", "text": message}
                 if images:
                     payload["images"] = images
-                response = session.send_message(payload)
+                with span_of("provider_request", model=spec.key,
+                             provider=spec.provider, attempt=attempt):
+                    response = session.send_message(payload)
             except ProviderError as e:
                 latency = _now() - started
                 self.layer.record_failure(spec, e, latency)
@@ -1012,7 +1035,8 @@ class JarvisBrain:
                         f"[BRAIN] reusing result for already-executed tool {tool_name}"
                     )
                 else:
-                    result = self._execute_tool_call(tool_name, tool_args)
+                    with span_of("tool_execute", tool=tool_name):
+                        result = self._execute_tool_call(tool_name, tool_args)
                     executed_this_turn[cache_key] = result
 
                 StatusIndicator.tool_result(tool_name, result)
@@ -1030,7 +1054,9 @@ class JarvisBrain:
             })
             turn_messages.append({"role": "tool", "results": results})
 
-            response = session.send_message({"kind": "tool_results", "results": results})
+            with span_of("provider_request", model=spec.key,
+                         provider=spec.provider, followup=True):
+                response = session.send_message({"kind": "tool_results", "results": results})
 
         reply = (response.text or "").strip()
         if reply:

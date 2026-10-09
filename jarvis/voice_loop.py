@@ -43,6 +43,7 @@ from jarvis.conversation import (
     ConversationMachine,
     State,
 )
+from jarvis.trace import new_trace, span_of, use_trace
 from jarvis.tone import get_tone
 from jarvis.logger import logger, StatusIndicator
 from jarvis.speech_pipeline import ASRUnavailable, SpeechPlayer, Transcriber
@@ -115,6 +116,8 @@ class VoiceLoop:
         self._wake_latched = False
         self._utterance = b""
         self._wake_rejections = 0
+        #: Last firing-frame wake inference time in ms, attached to the turn trace.
+        self._last_wake_ms = 0.0
         self.wake_events = 0
         self.interrupts = 0
         self.running = False
@@ -315,17 +318,21 @@ class VoiceLoop:
         Engines without `scores()` fall back to the legacy single check.
         """
         engine = self.wake_engine
-        scores_fn = getattr(engine, "scores", None)
-        if callable(scores_fn):
-            thresholds = getattr(engine, "thresholds", None) or {}
-            for phrase, s in scores_fn(pcm).items():
-                if s > thresholds.get(phrase, engine.threshold):
-                    return (phrase, s)
+        start = time.perf_counter()
+        try:
+            scores_fn = getattr(engine, "scores", None)
+            if callable(scores_fn):
+                thresholds = getattr(engine, "thresholds", None) or {}
+                for phrase, s in scores_fn(pcm).items():
+                    if s > thresholds.get(phrase, engine.threshold):
+                        return (phrase, s)
+                return None
+            s = engine.score(pcm)
+            if s > engine.threshold:
+                return (getattr(engine, "model", "wake word"), s)
             return None
-        s = engine.score(pcm)
-        if s > engine.threshold:
-            return (getattr(engine, "model", "wake word"), s)
-        return None
+        finally:
+            self._last_wake_ms = (time.perf_counter() - start) * 1000.0
 
     def on_wake(self) -> None:
         """IDLE -> LISTENING. Immediate, and idempotent while latched."""
@@ -394,62 +401,69 @@ class VoiceLoop:
                 self._turn_thread = threading.current_thread()
 
         turn = None
-        try:
-            if self.machine.state is State.IDLE:
-                return  # speech arrived with no conversation to serve
-
-            turn = self.machine.begin_turn()
-            self.machine.mark("speech_end", turn.id)
-
-            # -- TRANSCRIBING ------------------------------------------------
-            self.machine.transition(State.TRANSCRIBING, reason="speech ended")
-            text = self._transcribe(self._utterance, turn.id)
-            turn.transcript = text
-            if not text.strip():
-                # Never invent a transcript. This is the one failure the user
-                # most needs told about.
-                self.machine.fail("I didn't catch that.")
-                self._settle()
-                return
-
-            # -- THINKING ----------------------------------------------------
-            self.machine.transition(State.THINKING, reason="transcript ready")
-            reply = self._respond(text, turn.id)
-            if self.machine.is_stale(turn.id):
-                return  # interrupted while the model was thinking
-            if not (reply or "").strip():
-                self._settle()
-                return
-
-            # -- SPEAKING ----------------------------------------------------
-            self._speak(reply, turn.id)
-            if self.machine.is_stale(turn.id):
-                return
-            self.machine.end_turn(turn.id)
-
-            # -- FOLLOW_UP ---------------------------------------------------
-            self.machine.transition(State.FOLLOW_UP, reason="reply finished")
-            self.machine.mark("playback_end")
-            self._await_follow_up(turn.id)
-
-        except Exception as e:  # noqa: BLE001 - one bad turn must not kill the loop
-            # An interrupted turn is not a failure: the user took the floor and
-            # the next turn is already under way. Reporting ERROR here would
-            # stomp the state the interruption just established.
-            if turn is not None and self.machine.is_stale(turn.id):
-                return
-            self.last_error = str(e)
-            logger.error(f"[VOICE] turn failed: {e}", exc_info=True)
+        trace = new_trace()
+        with use_trace(trace):
+            trace.note("wake_frame_ms", round(self._last_wake_ms, 2))
             try:
-                self.machine.fail(str(e))
-            except Exception:  # noqa: BLE001
-                self.machine.transition(State.ERROR, reason=str(e), force=True)
-            self._settle()
-        finally:
-            with self._lock:
-                self._wake_latched = False
-                self.vad.reset()
-            self._utterance = b""
+                if self.machine.state is State.IDLE:
+                    return  # speech arrived with no conversation to serve
+
+                turn = self.machine.begin_turn()
+                self.machine.mark("speech_end", turn.id)
+
+                # -- TRANSCRIBING ------------------------------------------------
+                self.machine.transition(State.TRANSCRIBING, reason="speech ended")
+                with span_of("stt"):
+                    text = self._transcribe(self._utterance, turn.id)
+                turn.transcript = text
+                if not text.strip():
+                    # Never invent a transcript. This is the one failure the user
+                    # most needs told about.
+                    self.machine.fail("I didn't catch that.")
+                    self._settle()
+                    return
+
+                # -- THINKING ----------------------------------------------------
+                self.machine.transition(State.THINKING, reason="transcript ready")
+                with span_of("think"):
+                    reply = self._respond(text, turn.id)
+                if self.machine.is_stale(turn.id):
+                    return  # interrupted while the model was thinking
+                if not (reply or "").strip():
+                    self._settle()
+                    return
+
+                # -- SPEAKING ----------------------------------------------------
+                with span_of("speak"):
+                    self._speak(reply, turn.id)
+                if self.machine.is_stale(turn.id):
+                    return
+                self.machine.end_turn(turn.id)
+
+                # -- FOLLOW_UP ---------------------------------------------------
+                self.machine.transition(State.FOLLOW_UP, reason="reply finished")
+                self.machine.mark("playback_end")
+                self._await_follow_up(turn.id)
+
+            except Exception as e:  # noqa: BLE001 - one bad turn must not kill the loop
+                # An interrupted turn is not a failure: the user took the floor and
+                # the next turn is already under way. Reporting ERROR here would
+                # stomp the state the interruption just established.
+                if turn is not None and self.machine.is_stale(turn.id):
+                    return
+                self.last_error = str(e)
+                logger.error(f"[VOICE] turn failed: {e}", exc_info=True)
+                try:
+                    self.machine.fail(str(e))
+                except Exception:  # noqa: BLE001
+                    self.machine.transition(State.ERROR, reason=str(e), force=True)
+                self._settle()
+            finally:
+                trace.finish()
+                with self._lock:
+                    self._wake_latched = False
+                    self.vad.reset()
+                self._utterance = b""
 
     def _transcribe(self, audio: bytes, turn_id: str) -> str:
         if self.machine.is_stale(turn_id):
