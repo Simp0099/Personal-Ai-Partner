@@ -35,21 +35,57 @@ from jarvis.config import WAKE_WORD_THRESHOLD, WAKE_WORD_MODEL
 from jarvis.logger import logger, StatusIndicator
 
 
+def known_wake_models() -> set:
+    """Built-in model names in the installed openWakeWord, or empty if absent."""
+    try:
+        import openwakeword
+        return set(openwakeword.MODELS.keys())
+    except Exception:  # noqa: BLE001 - validation is best-effort
+        return set()
+
+
 class WakeWordEngine:
     """The openWakeWord model: load once, score chunks, release cleanly.
 
     Deliberately free of any audio device. Callers feed it PCM, which is what
     lets the same engine serve both the standalone listener and the Phase 4
     shared stream.
+
+    Phase 8: one engine serves every active phrase through a single
+    `Model(wakeword_models=[...])` inference call -- no extra microphone
+    stream per phrase. `phrases` is a list of {phrase, model, threshold}
+    entries (see `WAKE_WORD_PHRASES`); omitted means the legacy single model.
+    `score()`/`threshold`/`model` keep describing the primary phrase so
+    existing single-phrase callers are untouched.
     """
 
-    def __init__(self, model: str = None, threshold: float = None):
-        self.model = model or WAKE_WORD_MODEL
-        self.threshold = float(threshold if threshold is not None else WAKE_WORD_THRESHOLD)
+    def __init__(self, model: str = None, threshold: float = None, phrases: list = None):
+        if phrases is None:
+            phrases = [{"phrase": "hey jarvis",
+                        "model": model or WAKE_WORD_MODEL,
+                        "threshold": (WAKE_WORD_THRESHOLD if threshold is None
+                                      else float(threshold))}]
+        active = [dict(p) for p in phrases if p.get("model")]
+        if not active:
+            raise ValueError("WakeWordEngine needs at least one phrase with a model.")
+        self._phrases = active
+        primary = active[0]
+        self.model = primary["model"]
+        self.threshold = float(primary["threshold"])
+        self.phrase = primary.get("phrase", self.model)
+        #: Per-phrase thresholds, config order = fire priority on ties.
+        self.thresholds = {p.get("phrase", p["model"]): float(p["threshold"])
+                           for p in active}
+        #: Phrase -> model, for diagnostics.
+        self.models = {p.get("phrase", p["model"]): p["model"] for p in active}
         self._inference = None
 
     def load(self) -> bool:
-        """Load the model. Returns False rather than raising when unavailable."""
+        """Load all active models in one inference session.
+
+        Returns False rather than raising when unavailable; names the failing
+        models so a bad entry is diagnosable instead of silent.
+        """
         if self._inference is not None:
             return True
 
@@ -68,11 +104,19 @@ class WakeWordEngine:
             except Exception as e:  # noqa: BLE001 - older builds may lack it
                 logger.debug(f"Could not disable ONNX telemetry: {e}")
 
-            logger.info(f"Loading wake word model '{self.model}' (threshold: {self.threshold})...")
+            names = [p["model"] for p in self._phrases]
+            known = set(openwakeword.MODELS.keys())
+            unknown = [m for m in names if m not in known]
+            if unknown:
+                logger.error(f"Wake word model(s) not installed: {unknown}. "
+                             f"Known: {sorted(known)}.")
+                return False
 
-            # Use built-in model name — openWakeWord resolves the path automatically
+            logger.info(f"Loading wake word model(s) {names}...")
+
+            # Use built-in model names — openWakeWord resolves paths automatically
             self._inference = Model(
-                wakeword_models=[self.model],
+                wakeword_models=names,
                 inference_framework="onnx",
             )
             logger.info(f"Wake word engine ready. Listening for '{self.model}'...")
@@ -86,14 +130,22 @@ class WakeWordEngine:
     def loaded(self) -> bool:
         return self._inference is not None
 
-    def score(self, pcm) -> float:
-        """Confidence for one chunk of int16 PCM, in 0..1."""
+    def scores(self, pcm) -> dict:
+        """Confidence per active phrase for one chunk of int16 PCM, in 0..1."""
         if self._inference is None:
-            return 0.0
+            return {}
         import numpy as np
 
         prediction = self._inference.predict(np.frombuffer(pcm, dtype=np.int16))
-        return float(prediction.get(self.model, 0.0))
+        by_model = {p["model"]: p.get("phrase", p["model"]) for p in self._phrases}
+        return {by_model.get(name, name): float(score)
+                for name, score in prediction.items() if name in by_model}
+
+    def score(self, pcm) -> float:
+        """Confidence of the primary phrase. Kept for single-phrase callers."""
+        if self._inference is None:
+            return 0.0
+        return self.scores(pcm).get(self.phrase, 0.0)
 
     def close(self) -> None:
         """Release the inference engine.

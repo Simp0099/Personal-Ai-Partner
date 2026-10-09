@@ -336,6 +336,23 @@ wake_word:
   # Assistant speech ignored after playback stops, so the tail of a reply cannot
   # re-trigger the wake word through the speakers.
   echo_cooldown_seconds: 0.6
+  # Multi-phrase wake configuration (Phase 8). Each entry names its own
+  # openWakeWord model and threshold; all active models share the one
+  # microphone stream via a single inference call. Only entries verified
+  # against the installed openWakeWord 0.6.0 catalog may be enabled: that is
+  # just "hey_jarvis". "jarvis" has no verified built-in model and stays
+  # disabled until a custom model is provided -- a config entry is not proof
+  # of phrase support. Legacy `model`/`threshold` above remain the fallback
+  # when `phrases` is absent.
+  phrases:
+    - phrase: "hey jarvis"
+      model: "hey_jarvis"
+      threshold: 0.5
+      enabled: true
+    - phrase: "jarvis"
+      model: ""
+      threshold: 0.5
+      enabled: false
 
 # Voice activity detection (energy based, local, no extra dependency).
 vad:

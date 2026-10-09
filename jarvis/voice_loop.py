@@ -36,7 +36,7 @@ from jarvis.config import (
     FOLLOW_UP_WINDOW_S,
     WAKE_WORD_ECHO_COOLDOWN,
     WAKE_WORD_ENABLED,
-    WAKE_WORD_THRESHOLD,
+    WAKE_WORD_PHRASES,
 )
 from jarvis.conversation import (
     AssistantStateMachine,
@@ -97,7 +97,7 @@ class VoiceLoop:
         self.canceller = canceller or EchoCanceller(clock=clock)
         self.player = player or SpeechPlayer()
         self.transcriber = transcriber
-        self.wake_engine = wake_engine or WakeWordEngine(threshold=WAKE_WORD_THRESHOLD)
+        self.wake_engine = wake_engine or WakeWordEngine(phrases=WAKE_WORD_PHRASES)
         self.brain = brain
         self.respond = respond or self._ask_brain
         self.follow_up_window = float(follow_up_window)
@@ -280,8 +280,10 @@ class VoiceLoop:
         # air: it must not wake itself. The VAD keeps running underneath, so
         # barge-in remains possible throughout.
         if self.wake_enabled and not barge_in and not self.echo.should_suppress():
-            score = self.wake_engine.score(pcm)
-            if score > self.wake_engine.threshold:
+            fired = self._wake_fired(pcm)
+            if fired is not None:
+                phrase, score = fired
+                logger.debug(f"wake phrase matched: {phrase} score={score:.2f}")
                 if self._wake_latched:
                     # Overlapping chunks all score high for the same utterance.
                     self._wake_rejections += 1
@@ -304,6 +306,26 @@ class VoiceLoop:
     # ------------------------------------------------------------------
     # Wake and speech
     # ------------------------------------------------------------------
+
+    def _wake_fired(self, pcm) -> Optional[tuple]:
+        """First (phrase, score) above its threshold, config order wins ties.
+
+        One inference call scores every active phrase on the same shared chunk;
+        the wake latch then guarantees one utterance wakes the assistant once.
+        Engines without `scores()` fall back to the legacy single check.
+        """
+        engine = self.wake_engine
+        scores_fn = getattr(engine, "scores", None)
+        if callable(scores_fn):
+            thresholds = getattr(engine, "thresholds", None) or {}
+            for phrase, s in scores_fn(pcm).items():
+                if s > thresholds.get(phrase, engine.threshold):
+                    return (phrase, s)
+            return None
+        s = engine.score(pcm)
+        if s > engine.threshold:
+            return (getattr(engine, "model", "wake word"), s)
+        return None
 
     def on_wake(self) -> None:
         """IDLE -> LISTENING. Immediate, and idempotent while latched."""
@@ -572,6 +594,7 @@ class VoiceLoop:
             "wake_enabled": self.wake_enabled,
             "wake_model": self.wake_engine.model,
             "wake_threshold": self.wake_engine.threshold,
+            "wake_phrases": list(getattr(self.wake_engine, "thresholds", {}).keys()),
             "wake_events": self.wake_events,
             "wake_rejections": self._wake_rejections,
             "interrupts": self.interrupts,

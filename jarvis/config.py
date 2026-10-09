@@ -307,6 +307,53 @@ _CONVERSATION = CONFIG.get("conversation", {}) or {}
 WAKE_WORD_MODEL = _WAKE.get("model", "hey_jarvis")
 WAKE_WORD_THRESHOLD = float(_WAKE.get("threshold", 0.5))
 
+
+def _validated_wake_phrases(raw, default_model, default_threshold) -> list:
+    """Parse the `wake_word.phrases` list into active phrase entries.
+
+    Returns [{phrase, model, threshold, enabled}] for valid entries only.
+    Disabled entries are skipped silently (inert by definition); ENABLED
+    entries with a missing model or an out-of-range threshold are dropped
+    with a warning, never activated. Absent/invalid lists fall back to the
+    legacy single model so existing configuration keeps working.
+    """
+    fallback = [{"phrase": "hey jarvis", "model": default_model,
+                 "threshold": default_threshold, "enabled": True}]
+    if not isinstance(raw, list):
+        return fallback
+    parsed = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        phrase = entry.get("phrase", "")
+        phrase = " ".join(str(phrase).split())
+        enabled = bool(entry.get("enabled", True))
+        model = str(entry.get("model", "") or "").strip()
+        try:
+            threshold = float(entry.get("threshold", default_threshold))
+        except (TypeError, ValueError):
+            threshold = default_threshold
+        if not phrase or not model:
+            if enabled:
+                logger.warning(f"Ignoring wake phrase with no model: {phrase!r}.")
+            continue
+        if not 0.0 < threshold < 1.0:
+            if enabled:
+                logger.warning(f"Ignoring wake phrase with bad threshold: {phrase!r}.")
+            continue
+        parsed.append({"phrase": phrase, "model": model,
+                       "threshold": threshold, "enabled": enabled})
+    # NOTE: an explicitly emptied list is respected (no usable detector --
+    # the engine fails clearly at load). Only a missing key falls back.
+    return [p for p in parsed if p["enabled"]]
+
+
+#: Active wake phrases after validation. Empty model catalog at this layer is
+#: fine: the engine verifies names against installed models at load time.
+WAKE_WORD_PHRASES = _validated_wake_phrases(
+    _WAKE.get("phrases"), WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD
+)
+
 # Phase 4: the wake word is opt-in like the webcam. `enabled` gates the whole
 # voice pipeline, not just detection, so a disabled wake word leaves text mode
 # completely untouched.
