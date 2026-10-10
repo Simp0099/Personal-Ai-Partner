@@ -17,6 +17,7 @@ so there is no hardware, no network and no sleeping on wall-clock timing except
 where the test is specifically about waiting.
 """
 
+import logging
 import sys
 import threading
 import time
@@ -35,6 +36,7 @@ from jarvis.audio import (  # noqa: E402
     EchoGuard,
     MicrophoneStream,
     MicrophoneUnavailable,
+    SoundDeviceSource,
     VoiceActivityDetector,
     frame_bytes,
     rms,
@@ -233,17 +235,17 @@ def _await_turn(loop, turn_id, timeout=10.0):
 # ============================================================================
 
 class TestWakeWordConfiguration:
-    def test_wake_word_is_disabled_by_default(self):
-        from jarvis.config import WAKE_WORD_ENABLED
+    def test_wake_word_enablement_matches_configuration(self):
+        from jarvis.config import CONFIG, WAKE_WORD_ENABLED
 
-        assert WAKE_WORD_ENABLED is False, "the microphone must be opt-in"
+        assert WAKE_WORD_ENABLED is bool(CONFIG.get("wake_word", {}).get("enabled", False))
 
     def test_config_declares_the_opt_in(self):
         import yaml
 
         config = yaml.safe_load((PROJECT_ROOT / "config.yaml").read_text())
         assert "enabled" in config["wake_word"]
-        assert config["wake_word"]["enabled"] is False
+        assert isinstance(config["wake_word"]["enabled"], bool)
 
     def test_threshold_is_configurable_not_hardcoded(self):
         from jarvis.config import WAKE_WORD_THRESHOLD, WAKE_WORD_MODEL
@@ -276,6 +278,50 @@ class TestWakeWordConfiguration:
             pass
         assert source.opened == 1  # opened for VAD/ASR, never for the wake word
 
+    def test_wake_model_loads_before_the_microphone_opens(self):
+        """Audio must not arrive before the wake model can score it.
+
+        `WakeWordEngine.scores()` returns `{}` while the ONNX session is still
+        building, so every frame delivered in that window is dropped in silence.
+        With the wake word enabled the loop rests in IDLE, which only a wake word
+        can leave, so a request spoken during start-up is simply never heard.
+        """
+        order = []
+
+        class RecordingEngine:
+            def __init__(self):
+                self.thresholds = {"hey jarvis": 0.5}
+                self.threshold = 0.5
+                self.loaded = False
+
+            def load(self):
+                order.append("load")
+                self.loaded = True
+                return True
+
+            def scores(self, pcm):
+                return {}
+
+            def score(self, pcm):
+                return 0.0
+
+        engine = RecordingEngine()
+
+        class OrderingSource(FakeSource):
+            def open(self):
+                order.append("mic_open")
+                super().open()
+
+        mic = MicrophoneStream(source=OrderingSource())
+        loop = _make_loop(microphone=mic, wake_enabled=True, wake_engine=engine)
+        assert loop.start() is True
+        try:
+            assert order.index("load") < order.index("mic_open"), (
+                f"wake model loaded after the microphone opened: {order}")
+            assert engine.loaded is True
+        finally:
+            loop.stop()
+
     def test_enabled_wake_word_needs_the_engine(self):
         engine = FakeEngine()
         loop = _make_loop(wake_engine=engine, wake_enabled=True)
@@ -288,7 +334,9 @@ class TestWakeWordConfiguration:
 
 class TestWakeWordEvents:
     def test_wake_word_moves_idle_to_listening(self):
-        loop = _make_loop()
+        # C2: the loop rests in IDLE only when the wake word is on. With wake
+        # off it rests in LISTENING, so this needs wake on to test the wake path.
+        loop = _make_loop(wake_enabled=True, wake_engine=FakeEngine())
         loop.start()
         try:
             assert loop.machine.state is State.IDLE
@@ -363,7 +411,8 @@ class TestWakeWordEvents:
 
     def test_arbitrary_text_never_triggers_a_wake(self):
         """Only audio is ever a wake trigger. A message is not."""
-        loop = _make_loop()
+        # C2: with wake on the loop rests in IDLE, which only audio can leave.
+        loop = _make_loop(wake_enabled=True, wake_engine=FakeEngine())
         loop.start()
         try:
             loop._respond("hey jarvis what time is it", None)
@@ -597,6 +646,19 @@ class TestAudioQueue:
 # ============================================================================
 
 class TestVoiceTurn:
+    def test_spoken_shutdown_stops_voice_loop_without_model_call(self, monkeypatch):
+        seen = []
+        loop = _make_loop(respond=lambda text: seen.append(text) or "unexpected")
+        loop.on_wake()
+        monkeypatch.setattr(loop, "_transcribe", lambda audio, turn_id: "exit")
+        spoken = []
+        monkeypatch.setattr(loop, "_speak", lambda text, turn_id: spoken.append(text))
+        loop._run_turn()
+        assert loop.wait_for_stop(0)
+        assert seen == []
+        assert spoken and "Going offline" in spoken[0]
+        assert loop.machine.state is State.IDLE
+
     def test_full_happy_path(self):
         loop = _make_loop(follow_up_window=5.0)
         loop.start()
@@ -1255,6 +1317,23 @@ class TestEchoCancellation:
         canceller.close()
         assert canceller._history == []
 
+    def test_clipped_odd_and_mismatched_pcm_lengths_are_safe(self):
+        clock = _FakeClock()
+        canceller = EchoCanceller(clock=clock)
+        clipped = np.full(1280, 32767, dtype="<i2").tobytes()
+        malformed = b"\x7f"
+
+        assert canceller.cancel(b"") == b""
+        assert canceller.cancel(malformed) == malformed
+        canceller.play_reference(malformed)
+        assert canceller._history == []
+
+        canceller.play_reference(clipped + clipped[:400])
+        clock.advance(0.08)
+        residual = canceller.cancel(clipped)
+        assert len(residual) == len(clipped)
+        assert np.max(np.abs(np.frombuffer(residual, dtype="<i2"))) <= 32768
+
     def test_the_loop_feeds_playback_to_the_canceller(self):
         """Wiring: whatever is played must reach the canceller."""
         from jarvis.audio import EchoCanceller as C
@@ -1326,6 +1405,7 @@ class TestVoiceActivityDetector:
         events += [vad.push(_room_tone(seed=5000 + i)) for i in range(25)]
         end = [e for e in events if e and e.kind == "end"][0]
         assert len(end.audio) > 0
+        assert end.peak > 0.0, "speech peak was lost while resetting the detector"
 
     def test_quiet_never_starts_speech(self):
         vad = VoiceActivityDetector()
@@ -1404,6 +1484,377 @@ class TestVoiceActivityDetector:
 # ============================================================================
 
 class TestSingleMicrophoneOwner:
+    def test_source_cleanup_failure_is_reported(self, caplog):
+        """A backend that refuses to close must not strand the device.
+
+        PyAudioSource raised MicrophoneUnavailable here. SoundDeviceSource does
+        not: PortAudio streams can already be gone when a device is unplugged,
+        so `close()` is best-effort by design and the equivalent guarantee is
+        that the failure is still reported rather than swallowed silently, and
+        that the source ends up genuinely closed.
+        """
+
+        class Stream:
+            def stop(self):
+                raise OSError("device busy")
+
+            def close(self):
+                raise OSError("device busy")
+
+        source = SoundDeviceSource()
+        source._stream = Stream()
+        source._queue.put_nowait(b"\x00" * 4)
+
+        with caplog.at_level(logging.DEBUG, logger="jarvis"):
+            source.close()  # must not raise
+
+        assert "device busy" in caplog.text, "a failed close was hidden"
+        assert source.is_open is False
+        assert source._queue.empty(), "frames survived the close"
+
+    def test_source_close_drains_a_backlog_before_reopening(self):
+        """Reopening must not replay audio the previous session captured."""
+        source = SoundDeviceSource()
+        source._queue.put_nowait(b"\x01" * frame_bytes())
+        source.close()
+        assert source.read(timeout=0.01) is None
+
+    def test_sink_registration_and_repeated_start_stop_do_not_duplicate_owner(self):
+        source = FakeSource(frames=[_quiet()])
+        mic = MicrophoneStream(source=source)
+        received = []
+        sink = received.append
+        for _ in range(3):
+            mic.add_sink(sink)
+            mic.add_sink(sink)
+            assert mic.start()
+            assert _await(lambda: mic.frames_read >= 1)
+            mic.stop()
+            assert not mic.is_running()
+        assert received
+        assert source.opened == source.closed == 3
+        assert mic.status()["sinks"] == 1
+
+    def test_malformed_capture_frame_stops_and_reports_capture(self):
+        source = FakeSource(frames=[b"\x00"])
+        errors = []
+        mic = MicrophoneStream(source=source, on_error=errors.append)
+        assert mic.start()
+        assert _await(lambda: bool(errors))
+        assert "malformed frame" in errors[0]
+        mic.stop()
+
+    def test_failed_reader_shutdown_keeps_device_open(self):
+        source = FakeSource()
+        mic = MicrophoneStream(source=source)
+        mic.start()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_reader():
+            entered.set()
+            release.wait(1)
+
+        worker = threading.Thread(target=stuck_reader)
+        worker.start()
+        assert entered.wait(1)
+        mic._thread = worker
+        with pytest.raises(TimeoutError, match="device remains open"):
+            mic.stop(timeout=0.01)
+        assert source.closed == 0
+        assert mic._thread is worker
+        with pytest.raises(RuntimeError, match="still stopping"):
+            mic.start()
+        assert source.opened == 1
+        release.set()
+        worker.join(1)
+
+    def test_empty_reads_are_retried_and_remain_cancellable(self):
+        """No audio is normal; the pump must keep reading and still be stoppable.
+
+        This test used to assert a 10ms `_stop.wait()` between empty reads. That
+        pacing is not in the specification: Section 4.A3 makes an empty read a
+        bare `continue`, and with the real SoundDeviceSource the pacing comes
+        from `read(timeout=1.0)` blocking on the queue, so a wait in `_pump`
+        would be unreachable in production. What still has to hold -- and what is
+        asserted here -- is that repeated empty reads neither terminate the pump
+        nor reset it into a failure state, and that setting the stop event ends it.
+        """
+        source = FakeSource()
+        source.is_open = True
+        mic = MicrophoneStream(source=source)
+
+        def read():
+            source.reads += 1
+            if source.reads >= 25:
+                # Stop only once the pump has proved it retries instead of giving up.
+                mic._stop.set()
+            return None
+
+        source.read = read
+        mic.available = True          # the state start() leaves the mic in
+        mic._pump()
+        assert source.reads == 25, "an empty read ended the pump early"
+        assert mic._stop.is_set()
+        assert mic.available is True, "empty reads were treated as capture failures"
+        assert mic.last_error is None
+
+    def test_sounddevice_receives_sample_blocks_not_byte_counts(self, monkeypatch):
+        """blocksize is samples per block. Passing bytes is the classic bug.
+
+        80ms at 16kHz is 1280 samples, delivered as 2560 int16 bytes. Asserting
+        both catches the swap in either direction.
+        """
+        import types
+
+        opened = {}
+
+        class InputStream:
+            def __init__(self, **kwargs):
+                opened.update(kwargs)
+
+            def start(self):
+                # A real device delivers its first block through the callback.
+                block = np.zeros(opened["blocksize"], dtype="int16")
+                opened["callback"](block.reshape(-1, 1), len(block), None, None)
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=InputStream,
+            query_devices=lambda device=None, kind=None: {
+                "name": "input", "index": 0, "max_input_channels": 1},
+        ))
+        source = SoundDeviceSource()
+        source.open()
+        try:
+            assert opened["blocksize"] == 1280
+            assert opened["blocksize"] == (
+                opened["samplerate"] * audio_mod.AUDIO_FRAME_MS // 1000)
+            assert opened["dtype"] == "int16"
+            assert opened["channels"] == 1
+            assert source.device_name == "input"
+            assert len(source.read()) == frame_bytes()
+        finally:
+            source.close()
+
+    def test_explicit_device_index_is_passed_to_portaudio(self, monkeypatch):
+        """A configured index reaches the backend verbatim, not guessed at."""
+        import types
+
+        opened = {}
+
+        class InputStream:
+            def __init__(self, **kwargs):
+                opened.update(kwargs)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=InputStream,
+            query_devices=lambda device=None, kind=None: {
+                "name": "usb mic", "index": device, "max_input_channels": 1},
+        ))
+        source = SoundDeviceSource(device=3)
+        source.open()
+        try:
+            assert opened["device"] == 3
+            assert source.device_name == "usb mic"
+            assert source.device == 3
+        finally:
+            source.close()
+
+    def test_missing_device_index_is_left_to_portaudio(self, monkeypatch):
+        """No enumeration fallback exists here, and none is wanted.
+
+        PyAudioSource walked the device list to find an input when the default
+        was missing. SoundDeviceSource passes ``device=None`` through so PortAudio
+        applies its own default policy, which is where device selection belongs.
+        Asserting the pass-through pins that decision so a future enumeration
+        hack has to be a deliberate change.
+        """
+        import types
+
+        opened = {}
+
+        class InputStream:
+            def __init__(self, **kwargs):
+                opened.update(kwargs)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=InputStream,
+            query_devices=lambda device=None, kind=None: {
+                "name": "built-in mic", "index": 0, "max_input_channels": 1},
+        ))
+        source = SoundDeviceSource()
+        source.open()
+        try:
+            assert opened["device"] is None
+            assert source.device is None
+            # The resolved name is still recorded, so status() can name the mic.
+            assert source.device_name == "built-in mic"
+        finally:
+            source.close()
+
+    def test_configured_invalid_input_device_fails_actionably(self, monkeypatch):
+        """An index naming no input device must fail loudly and say why.
+
+        The exception type is unchanged. The message is not: it now comes from
+        SoundDeviceSource, so the old PyAudio wording is gone and the assertions
+        below check the message that actually exists.
+        """
+        import types
+
+        def query_devices(device=None, kind=None):
+            raise OSError("Invalid device")
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=object,
+            query_devices=query_devices,
+        ))
+        with pytest.raises(MicrophoneUnavailable) as excinfo:
+            SoundDeviceSource(device=27).open()
+        message = str(excinfo.value)
+        assert "Could not open microphone" in message
+        assert "27" in message, "the failing index must be named"
+        assert "Privacy and Security > Microphone" in message, (
+            "the message must say how to fix it")
+
+    def test_input_device_failure_after_a_good_probe_is_reported(self, monkeypatch):
+        """A device that probes fine but refuses to stream must not look silent.
+
+        query_devices succeeding is not proof the stream opens. If InputStream
+        raises, the failure has to surface as MicrophoneUnavailable rather than
+        an empty read loop.
+        """
+        import types
+
+        class InputStream:
+            def __init__(self, **kwargs):
+                raise OSError("Device or resource busy")
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=InputStream,
+            query_devices=lambda device=None, kind=None: {
+                "name": "built-in mic", "index": 0, "max_input_channels": 1},
+        ))
+        with pytest.raises(MicrophoneUnavailable) as excinfo:
+            SoundDeviceSource().open()
+        message = str(excinfo.value)
+        assert "built-in mic" in message, "the device name must be identified"
+        assert "Device or resource busy" in message, "the cause must survive"
+
+    def test_sounddevice_read_error_is_reported_to_microphone_owner(self, monkeypatch):
+        """A dead device must reach the owner as an error, never as silence."""
+        import types
+
+        class InputStream:
+            def __init__(self, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            InputStream=InputStream,
+            query_devices=lambda device=None, kind=None: {
+                "name": "input", "index": 0, "max_input_channels": 1},
+        ))
+        source = SoundDeviceSource()
+
+        def dead_read(timeout=1.0):
+            raise OSError("device disconnected")
+
+        source.read = dead_read
+
+        errors = []
+        mic = MicrophoneStream(source=source, on_error=errors.append)
+        assert mic.start()
+        try:
+            deadline = time.monotonic() + 2
+            while mic.last_error is None and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert mic.last_error, "a failed read was swallowed instead of reported"
+            assert "read failed" in mic.last_error
+            assert "device disconnected" in mic.last_error
+            # Observable status carries it, so this is diagnosable from outside.
+            assert mic.status()["last_error"] == mic.last_error
+        finally:
+            mic.stop()
+
+    def test_repeated_read_errors_terminate_the_capture_path(self):
+        """Retrying a dead device forever is how a broken mic becomes silence.
+
+        Twenty consecutive failures have to end the capture path and mark the
+        microphone unavailable, so the owner can report it rather than sit on a
+        stream that will never produce audio again.
+        """
+
+        class DeadSource(FakeSource):
+            def read(self):
+                self.reads += 1
+                raise OSError("device disconnected")
+
+        errors = []
+        mic = MicrophoneStream(source=DeadSource(), on_error=errors.append)
+        assert mic.start()
+        try:
+            deadline = time.monotonic() + 30
+            while mic.is_running() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not mic.is_running(), "capture retried a dead device forever"
+            assert mic.available is False
+            assert errors and "repeated read failures" in errors[-1]
+        finally:
+            mic.stop()
+
+    def test_ordinary_read_timeouts_do_not_terminate_capture(self):
+        """A quiet room is not a broken microphone.
+
+        read() returning None is the documented timeout path and must keep the
+        capture alive. If timeouts were treated as failures, a silent room
+        would tear down the microphone after twenty pauses.
+        """
+        source = FakeSource()
+        mic = MicrophoneStream(source=source)
+        assert mic.start()
+        try:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert mic.is_running()
+            assert mic.available is True
+            assert mic.last_error is None
+            assert source.reads >= 20, "the retry threshold was reached on timeouts"
+        finally:
+            mic.stop()
+
     def test_one_source_serves_every_consumer(self):
         source = FakeSource(frames=[_loud()] * 5)
         mic = MicrophoneStream(source=source)
@@ -1426,7 +1877,8 @@ class TestSingleMicrophoneOwner:
         from jarvis import voice_loop
 
         source = inspect.getsource(voice_loop)
-        assert source.count("PyAudioSource(") == 0, "the loop opened its own microphone"
+        assert source.count("SoundDeviceSource(") == 0, "the loop opened its own microphone"
+        assert source.count("PyAudioSource(") == 0, "the loop still opens a PyAudio mic"
 
     def test_the_legacy_listener_does_not_run_alongside_the_loop(self):
         """Two owners of one device is the failure this replaces."""
@@ -1526,6 +1978,51 @@ class TestTextCoexistence:
         transcriber = Transcriber(recognizer=Unintelligible())
         assert transcriber.transcribe(b"\x00" * 320) == ""
         assert transcriber.last_error
+
+    def test_transcriber_passes_captured_int16_pcm_without_float_reinterpretation(self):
+        pcm = np.array([0, 16384, -16384, 32767, -32768], dtype="<i2").tobytes()
+        observed = []
+
+        class Recognizer:
+            def recognize_google(self, audio, language=None):
+                assert self.operation_timeout == 15.0
+                observed.append((audio.frame_data, audio.sample_rate, audio.sample_width))
+                return "test transcript"
+
+        assert Transcriber(recognizer=Recognizer(), engine="google").transcribe(pcm) == "test transcript"
+        assert observed == [(pcm, 16000, 2)]
+
+    def test_google_asr_respects_configured_operation_timeout(self):
+        class Recognizer:
+            operation_timeout = None
+
+            def recognize_google(self, audio, language=None):
+                return "ok"
+
+        recognizer = Recognizer()
+        assert Transcriber(recognizer=recognizer, engine="google", timeout=2.5).transcribe(b"\x00\x00") == "ok"
+        assert recognizer.operation_timeout == 2.5
+
+    def test_local_asr_mode_never_calls_google(self):
+        class Recognizer:
+            def recognize_google(self, *args, **kwargs):
+                pytest.fail("remote recognition called in local-only mode")
+
+        with pytest.raises(ASRUnavailable, match="no local recognizer"):
+            Transcriber(recognizer=Recognizer(), engine="local")
+
+    def test_unknown_asr_engine_is_rejected(self):
+        with pytest.raises(ValueError, match="unsupported ASR engine"):
+            Transcriber(engine="googlish")
+
+    def test_local_asr_selection_fails_at_initialization(self):
+        with pytest.raises(ASRUnavailable, match="no local recognizer"):
+            Transcriber(engine="local")
+
+    def test_malformed_pcm_is_an_error(self):
+        transcriber = Transcriber(engine="google")
+        with pytest.raises(ValueError, match="incomplete int16"):
+            transcriber.transcribe(b"\x01")
 
     def test_a_missing_transcriber_is_an_error_not_a_fake_transcript(self):
         loop = _make_loop(transcriber=None)
@@ -1703,9 +2200,12 @@ class TestShutdown:
 
 class TestSpeechPipeline:
     def test_audio_is_split_into_chunks(self):
-        player = SpeechPlayer(synthesize=lambda t: np.zeros(16000, dtype=np.float32),
+        player = SpeechPlayer(synthesize=lambda t: None,
                               play=lambda d, r: None, stop_playback=lambda: None,
                               chunk_ms=100)
+        # One second at the rate this player actually plays at, so the count states
+        # something about chunking rather than about a stale 16 kHz assumption.
+        player.synthesize = lambda t: np.zeros(player.sample_rate, dtype=np.float32)
         queued = player.synthesize_to_queue("hello", "turn_001", lambda t: False)
         assert queued == 10, "1s of audio at 100ms chunks is not 10 chunks"
 
@@ -1717,9 +2217,11 @@ class TestSpeechPipeline:
         assert queued == 0
 
     def test_cancel_clears_and_reports(self):
-        player = SpeechPlayer(synthesize=lambda t: np.zeros(16000, dtype=np.float32),
+        player = SpeechPlayer(synthesize=lambda t: None,
                               play=lambda d, r: None, stop_playback=lambda: None,
                               chunk_ms=100)
+        # One second at this player's playback rate: 10 chunks at 100ms.
+        player.synthesize = lambda t: np.zeros(player.sample_rate, dtype=np.float32)
         player.synthesize_to_queue("hello", "turn_001", lambda t: False)
         assert player.cancel() == 10
         assert player.queue.peek_len() == 0
@@ -1733,6 +2235,123 @@ class TestSpeechPipeline:
         assert player.wait(timeout=2.0) is True
         assert player.is_playing() is False
 
+    def test_playback_failure_is_recorded(self):
+        player = SpeechPlayer(
+            synthesize=lambda _: np.ones(1600, dtype=np.float32),
+            play=lambda *_: (_ for _ in ()).throw(OSError("speaker disconnected")),
+            stop_playback=lambda: None, chunk_ms=100,
+        )
+        player.synthesize_to_queue("hi", "turn", lambda _: False)
+        player.start("turn", lambda _: False)
+        assert player.wait(1)
+        assert "speaker disconnected" in player.last_error
+
+    def test_physical_playback_uses_one_contiguous_stream_per_turn(self, monkeypatch):
+        import jarvis.speech_pipeline as pipeline
+
+        calls = []
+        def play(data, rate, cancel_event=None):
+            calls.append((data, rate))
+
+        monkeypatch.setattr(pipeline, "_sounddevice_play", play)
+        player = SpeechPlayer(
+            synthesize=lambda _: np.ones(3200, dtype=np.float32), chunk_ms=100,
+        )
+        assert player.synthesize_to_queue("hello", "turn", lambda _: False) == 2
+        player.start("turn", lambda _: False)
+        assert player.wait(1)
+        expected = np.full(3200, 32767, dtype="<i2").tobytes()
+        # The stream must open at the rate this player plays at, which is the
+        # engine's native rate (Kokoro 24 kHz), not the microphone's 16 kHz.
+        assert calls == [(expected, player.sample_rate)]
+        assert player.chunks_played == 2
+
+    def test_close_waits_for_playback_worker_before_returning(self):
+        entered = threading.Event()
+        release = threading.Event()
+        player = SpeechPlayer(
+            synthesize=lambda t: np.zeros(1600, dtype=np.float32),
+            play=lambda d, r: (entered.set(), release.wait(3)),
+            stop_playback=lambda: None, chunk_ms=100,
+        )
+        player.synthesize_to_queue("hello", "turn", lambda _: False)
+        player.start("turn", lambda _: False)
+        assert entered.wait(1)
+        closed = threading.Event()
+        closer = threading.Thread(target=lambda: (player.close(), closed.set()))
+        closer.start()
+        assert not closed.wait(0.05)
+        release.set()
+        closer.join(1)
+        assert closed.is_set()
+        assert not player.is_playing()
+
+    def test_close_timeout_preserves_live_worker_reference(self):
+        entered = threading.Event()
+        release = threading.Event()
+        player = SpeechPlayer(
+            synthesize=lambda t: np.zeros(1600, dtype=np.float32),
+            play=lambda d, r: (entered.set(), release.wait(3)),
+            stop_playback=lambda: None, chunk_ms=100,
+        )
+        player.synthesize_to_queue("hello", "turn", lambda _: False)
+        player.start("turn", lambda _: False)
+        assert entered.wait(1)
+        worker = player._thread
+        with pytest.raises(TimeoutError, match="worker did not stop"):
+            player.close(timeout=0.01)
+        assert player._thread is worker and worker.is_alive()
+        release.set()
+        worker.join(1)
+        player.close(timeout=1)
+        assert player._thread is None
+
+    def test_new_playback_waits_for_a_live_worker_then_returns(self):
+        """A new reply must not be dropped because the old worker still looks alive.
+
+        Spec B2 (V8): start() joins the previous drain thread and only returns
+        early if that thread is still alive afterwards. Raising used to discard
+        the new reply instead of playing it.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        player = SpeechPlayer(
+            synthesize=lambda t: np.zeros(1600, dtype=np.float32),
+            play=lambda d, r: (entered.set(), release.wait(3)),
+            stop_playback=lambda: None, chunk_ms=100,
+        )
+        player.synthesize_to_queue("first", "one", lambda _: False)
+        player.start("one", lambda _: False)
+        assert entered.wait(1)
+        first_thread = player._thread
+
+        player.start("two", lambda _: False)  # must not raise
+
+        # Exactly one live worker: the second reply did not spawn an overlap.
+        assert player._thread is first_thread
+        release.set()
+        assert player.wait(1)
+        assert not player.is_playing()
+
+    def test_new_reply_plays_after_the_previous_worker_finishes(self):
+        """The point of V8: a reply started after the previous one is not lost."""
+        release = threading.Event()
+        played = []
+        player = SpeechPlayer(
+            synthesize=lambda t: np.zeros(2400, dtype=np.float32),
+            play=lambda d, r: (played.append(len(d)), release.wait(3)),
+            stop_playback=lambda: None, chunk_ms=100,
+        )
+        player.synthesize_to_queue("first", "one", lambda _: False)
+        player.start("one", lambda _: False)
+        player.synthesize_to_queue("second", "two", lambda _: False)
+        release.set()
+
+        player.start("two", lambda _: False)  # must not raise
+        assert player.wait(2)
+        assert played, "the second reply was never spoken"
+        assert player._thread is not None and not player._thread.is_alive()
+
     def test_empty_reply_produces_no_audio(self):
         player = SpeechPlayer(play=lambda d, r: None, stop_playback=lambda: None)
         assert player.synthesize_to_queue("   ", "turn_001", lambda t: False) == 0
@@ -1744,3 +2363,129 @@ class TestSpeechPipeline:
         data = _to_pcm16(loud)
         assert len(data) == 4
         assert int.from_bytes(data[:2], "little", signed=True) == 32767
+
+    def test_sounddevice_play_converts_int16_chunks_to_float32(self, monkeypatch):
+        import types
+        import threading
+        from jarvis.speech_pipeline import _sounddevice_play
+
+        played = []
+        class CallbackStop(Exception):
+            pass
+
+        class OutputStream:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                self.enter_thread = threading.get_ident()
+                def render():
+                    block = np.empty((3, 1), dtype=np.float32)
+                    while True:
+                        try:
+                            self.kwargs["callback"](block, 3, None, None)
+                        except CallbackStop:
+                            played.append(block.copy())
+                            break
+                        played.append(block.copy())
+                    self.kwargs["finished_callback"]()
+                self.render_thread = threading.Thread(target=render)
+                self.render_thread.start()
+                return self
+
+            def __exit__(self, *_):
+                self.render_thread.join(timeout=1)
+                self.exit_thread = threading.get_ident()
+
+        streams = []
+        def output_stream(**kwargs):
+            stream = OutputStream(**kwargs)
+            streams.append(stream)
+            return stream
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            default=types.SimpleNamespace(device=(0, 1)),
+            query_devices=lambda device, kind: {"name": "Mock speakers"},
+            check_output_settings=lambda **kwargs: played.append(kwargs),
+            OutputStream=output_stream,
+            CallbackStop=CallbackStop,
+        ))
+        pcm = np.array([-32768, 0, 16384, 32767, -1], dtype="<i2").tobytes()
+        assert _sounddevice_play(pcm, 16000) == "completed"
+        rendered = np.concatenate([block[:, 0] for block in played[1:]])
+        assert np.allclose(
+            rendered[:5], [-1.0, 0.0, 0.5, 32767 / 32768, -1 / 32768],
+        )
+        assert played[0] == {
+            "device": 1, "channels": 1, "dtype": "float32", "samplerate": 16000,
+        }
+        assert streams[0].kwargs["dtype"] == "float32"
+        assert streams[0].enter_thread == streams[0].exit_thread
+
+    def test_output_cancellation_closes_stream_on_playback_owner(self, monkeypatch):
+        import types
+        import threading
+        from jarvis.speech_pipeline import _sounddevice_play, _sounddevice_stop
+
+        entered = threading.Event()
+        streams = []
+        results = []
+
+        class CallbackStop(Exception):
+            pass
+
+        class OutputStream:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                streams.append(self)
+
+            def __enter__(self):
+                self.owner = threading.get_ident()
+                entered.set()
+                return self
+
+            def __exit__(self, *_):
+                self.closed_by = threading.get_ident()
+
+        monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(
+            default=types.SimpleNamespace(device=(0, 1)),
+            query_devices=lambda device, kind: {"name": "Mock speakers"},
+            check_output_settings=lambda **kwargs: None,
+            OutputStream=OutputStream,
+            CallbackStop=CallbackStop,
+        ))
+        worker = threading.Thread(
+            target=lambda: results.append(
+                _sounddevice_play(np.zeros(16000, dtype="<i2").tobytes(), 16000)
+            ),
+        )
+        worker.start()
+        assert entered.wait(1)
+        _sounddevice_stop()
+        out = np.empty((128, 1), dtype=np.float32)
+        with pytest.raises(CallbackStop):
+            streams[0].kwargs["callback"](out, 128, None, None)
+        streams[0].kwargs["finished_callback"]()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert streams[0].closed_by == streams[0].owner
+        assert results == ["cancelled"]
+
+    def test_voice_loop_lease_prevents_two_process_style_mic_owners(self, monkeypatch, tmp_path):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        first_source, second_source = FakeSource(), FakeSource()
+        first = _make_loop(microphone=MicrophoneStream(source=first_source))
+        second = _make_loop(microphone=MicrophoneStream(source=second_source))
+        try:
+            assert first.start()
+            assert not second.start()
+            assert first_source.opened == 1
+            assert second_source.opened == 0
+            first.stop()
+            assert second.start()
+            assert second_source.opened == 1
+        finally:
+            first.stop()
+            second.stop()

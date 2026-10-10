@@ -52,16 +52,22 @@ class FakeMultiEngine(WakeWordEngine):
 
 
 class FakeSource:
-    def __init__(self):
+    def __init__(self, frames=None, on_open=None):
+        self.frames = list(frames or [])
+        self.on_open = on_open
         self.opened = 0
         self.is_open = False
 
     def open(self):
         self.opened += 1
         self.is_open = True
+        if self.on_open:
+            self.on_open()
 
     def read(self):
         import time
+        if self.frames:
+            return self.frames.pop(0)
         time.sleep(0.005)
         return None
 
@@ -174,6 +180,30 @@ class TestEngine:
         assert engine.threshold == 0.5  # primary unchanged
         assert engine.score(b"") == 0.0  # unloaded → silent
 
+    def test_model_scores_map_to_configured_phrase(self):
+        from types import SimpleNamespace
+        import numpy as np
+
+        engine = WakeWordEngine(phrases=[
+            {"phrase": "hey jarvis", "model": "hey_jarvis", "threshold": 0.5},
+        ])
+        engine._inference = SimpleNamespace(predict=lambda samples: {
+            "hey_jarvis": 0.75,
+        })
+        frame = np.zeros(1280, dtype="<i2").tobytes()
+        assert engine.scores(frame) == {"hey jarvis": 0.75}
+
+    def test_malformed_frames_are_rejected_before_native_inference(self):
+        from types import SimpleNamespace
+
+        calls = []
+        engine = WakeWordEngine()
+        engine._inference = SimpleNamespace(predict=lambda pcm: calls.append(pcm) or {})
+        for pcm in (b"", b"\x01", bytes(8), bytes(4096)):
+            with pytest.raises(ValueError, match="wake-word frame"):
+                engine.scores(pcm)
+        assert calls == []
+
     def test_legacy_single_phrase_compat(self):
         engine = WakeWordEngine()
         assert engine.model == "hey_jarvis"
@@ -222,6 +252,69 @@ class TestSharedPipeline:
         loop.on_wake()
         assert loop.machine.state is State.LISTENING
 
+    def test_started_microphone_frames_reach_wake_inference(self):
+        from jarvis.audio import MicrophoneStream
+
+        frame = _pcm()
+        engine = FakeMultiEngine(scores=[{"hey jarvis": 0.95}])
+        source = FakeSource(frames=[frame])
+        loop = _loop(engine, microphone=MicrophoneStream(source=source))
+
+        assert loop.start() is True
+        try:
+            import time
+            deadline = time.monotonic() + 1
+            while loop.machine.state is State.IDLE and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert engine.loads == 1
+            assert loop.microphone.frames_read >= 1
+            assert loop.machine.state is State.LISTENING
+            assert loop.wake_events == 1
+        finally:
+            loop.stop()
+
+    def test_frame_sink_is_registered_before_stream_opens(self):
+        from jarvis.audio import MicrophoneStream
+
+        registered = []
+        engine = FakeMultiEngine(scores=[{"hey jarvis": 0.95}])
+        source = FakeSource(frames=[_pcm()], on_open=lambda: registered.append(
+            loop._on_frame in loop.microphone._sinks
+        ))
+        loop = _loop(engine, microphone=MicrophoneStream(source=source))
+        assert loop.start() is True
+        try:
+            assert registered == [True]
+            import time
+            deadline = time.monotonic() + 1
+            while loop.machine.state is State.IDLE and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert loop.machine.state is State.LISTENING
+            assert loop.wake_events == 1
+        finally:
+            loop.stop()
+
+    def test_inference_exception_is_logged_and_does_not_kill_stream(self, caplog):
+        engine = FakeMultiEngine()
+        engine.scores = lambda pcm: (_ for _ in ()).throw(RuntimeError("bad frame"))
+        loop = _loop(engine)
+        with caplog.at_level("ERROR", logger="jarvis"):
+            loop._on_frame(_pcm())
+        assert loop.machine.state is State.IDLE
+        assert any("[WAKE] inference failed: bad frame" in r.message
+                   for r in caplog.records)
+
+    def test_malformed_capture_frames_never_reach_inference_or_vad(self):
+        engine = FakeMultiEngine()
+        inference, vad = [], FakeVAD()
+        engine.scores = lambda pcm: inference.append(pcm) or {}
+        loop = _loop(engine)
+        loop.vad = vad
+        loop._on_frame(b"\x00")
+        loop._on_frame(b"")
+        assert inference == []
+        assert vad.frames == 0
+
     def test_shutdown_cleans_up(self):
         engine = FakeMultiEngine()
         loop = _loop(engine)
@@ -231,12 +324,14 @@ class TestSharedPipeline:
         assert loop.machine.state is State.IDLE
         assert loop.is_running() is False
 
-    def test_init_failure_disables_voice_safely(self):
+    def test_init_failure_does_not_report_dead_voice_as_active(self):
         from jarvis.audio import MicrophoneStream
+        source = FakeSource()
         loop = _loop(FakeMultiEngine(loaded_ok=False),
-                     microphone=MicrophoneStream(source=FakeSource()))
-        assert loop.start() is True
-        assert loop.wake_enabled is False
+                     microphone=MicrophoneStream(source=source))
+        assert loop.start() is False
+        assert loop.is_running() is False
+        assert source.opened == 0
         loop.stop()
 
 
@@ -261,3 +356,21 @@ class TestLogging:
             assert any("hey jarvis" in r.message for r in caplog.records)
         finally:
             configure_logging(debug=False)
+
+    def test_runtime_microphone_failure_stops_voice_loop_with_reason(self):
+        loop = _loop(FakeMultiEngine())
+        loop.running = True
+        loop._on_microphone_error("device disconnected")
+        assert loop.last_error == "device disconnected"
+        assert loop.running is False
+        assert loop.wait_for_stop(0)
+        assert loop.machine.state is State.IDLE
+
+    def test_wake_indicator_reports_actual_score(self, monkeypatch):
+        from jarvis.logger import StatusIndicator
+
+        reported = []
+        monkeypatch.setattr(StatusIndicator, "wake_detected", reported.append)
+        loop = _loop(FakeMultiEngine(scores=[{"hey jarvis": 0.91}]))
+        loop._on_frame(_pcm())
+        assert reported == [0.91]

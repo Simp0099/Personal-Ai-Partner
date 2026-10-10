@@ -415,7 +415,13 @@ class ChatSession(ABC):
         """Send one turn.
 
         ``payload`` is either ``{"kind": "user", "text": str}`` or
-        ``{"kind": "tool_results", "results": [{"id","name","result"}]}``.
+        ``{"kind": "tool_results", "results": [{"id","name","result"}]}.
+
+        The deadline comes from the session's ``timeout`` option, which the
+        Brain sets from what is left of the *turn's* budget rather than a
+        fresh per-call allowance: a tool loop that keeps calling tools must
+        not restart the clock each round. Adapters apply it per HTTP request,
+        which is the granularity every supported transport exposes.
         """
 
     def close(self) -> None:

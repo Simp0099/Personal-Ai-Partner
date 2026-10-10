@@ -63,9 +63,10 @@ class State(str, Enum):
 _ALLOWED: Dict[State, Set[State]] = {
     State.IDLE: {State.LISTENING, State.ERROR},
     State.LISTENING: {State.TRANSCRIBING, State.IDLE, State.ERROR},
-    State.TRANSCRIBING: {State.THINKING, State.INTERRUPTED, State.ERROR, State.IDLE},
+    State.TRANSCRIBING: {State.THINKING, State.INTERRUPTED, State.ERROR, State.IDLE,
+                          State.LISTENING},
     State.THINKING: {State.SPEAKING, State.INTERRUPTED, State.ERROR,
-                      State.FOLLOW_UP, State.IDLE},
+                      State.FOLLOW_UP, State.IDLE, State.LISTENING},
     State.SPEAKING: {State.FOLLOW_UP, State.INTERRUPTED, State.ERROR,
                      State.THINKING, State.IDLE},
     State.FOLLOW_UP: {State.LISTENING, State.IDLE, State.ERROR},

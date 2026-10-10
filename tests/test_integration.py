@@ -264,7 +264,7 @@ class TestToolExecution:
 
         expected_tools = [
             "search_wikipedia", "open_website", "search_youtube",
-            "search_google", "open_maps", "get_temperature",
+            "search_google", "open_maps", "get_weather",
             "get_nasa_apod", "take_screenshot", "play_music",
             "lookup_dictionary", "send_email", "tell_time",
             "tell_joke", "get_system_time", "get_directory_contents",

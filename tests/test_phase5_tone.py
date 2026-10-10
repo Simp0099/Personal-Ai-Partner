@@ -135,7 +135,6 @@ def _loop(respond=None, **kwargs):
         def transcribe(self, pcm, sample_rate=16000):
             return "what time is it"
 
-    kwargs.setdefault("wake_enabled", False)
     kwargs.setdefault("follow_up_window", 0.2)
     return VoiceLoop(
         microphone=MicrophoneStream(source=Source()),
@@ -796,15 +795,15 @@ class TestTTSCompatibility:
 
         from jarvis import speech
 
-        signature = inspect.signature(speech._synthesize_chatterbox)
+        signature = inspect.signature(speech.synthesize_for_engine)
         assert "exaggeration" in signature.parameters
         assert signature.parameters["exaggeration"].default is None
 
     def test_the_default_is_unchanged_when_no_hint_is_given(self):
         from jarvis import speech
-        from jarvis.config import CHATTERBOX_EXAGGERATION
+        from jarvis.config import KOKORO_SPEED
 
-        assert CHATTERBOX_EXAGGERATION == 0.5
+        assert KOKORO_SPEED == 1.0
 
     def test_a_celebratory_state_asks_for_livelier_delivery(self):
         state = ConversationState(mood=Mood.CELEBRATORY, energy=0.9)
@@ -848,7 +847,7 @@ class TestTTSCompatibility:
         try:
             loop.machine.transition(State.SPEAKING, force=True)
             loop._speak("yes!", loop.machine.begin_turn().id)
-            assert loop.player.exaggeration is not None
+            assert loop.player.exaggeration == 0.8
         finally:
             loop.stop()
             tone.get_tone().reset()

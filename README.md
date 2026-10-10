@@ -10,13 +10,15 @@ Under active development. Honest snapshot of what exists today:
 
 - Core architecture: implemented (`jarvis/`)
 - Terminal interface: active — `python -m jarvis`
-- Wake-word mode: implemented (openWakeWord, `hey_jarvis`), off by default
-- Voice pipeline: implemented — shared-mic audio/VAD, STT, Chatterbox TTS
+- Wake-word mode: implemented (openWakeWord, `hey_jarvis`), enabled by config
+- Voice pipeline: implemented — shared-mic audio/VAD, STT, Kokoro TTS
+- ASR backend: set `speech.asr_engine: "google"` to explicitly permit remote
+  recognition; `local` remains unavailable until a local recognizer is configured
 - AI routing: implemented — Gemini + OpenRouter + OpenCode Zen, ranked fallback
 - Vision/perception: implemented — attached images always; webcam opt-in
 - Memory: implemented — session context + SQLite long-term facts
 - Tools/IoT foundation: implemented (system, web, media, email, weather, …)
-- Test suite: 793 passing (`pytest tests/`)
+- Test suite: see the current baseline and verification reports
 - Dedicated graphical interface: intentionally deferred (terminal is the UI)
 
 Live microphone, speaker, camera, and live-model paths are implemented in code
@@ -38,7 +40,7 @@ AI / Reasoning  (router → Gemini / OpenRouter / Zen → tool loop)
    ↓
 Memory / Vision / Tools
    ↓
-Text-to-Speech  (Chatterbox, voice-cloned)
+Text-to-Speech  (Kokoro)
    ↓
 Speaker
 ```
@@ -52,9 +54,9 @@ no second process: `python -m jarvis` runs the whole assistant.
 - Wake-word activation (`hey_jarvis`, local/offline via openWakeWord)
 - Single-microphone pipeline: wake word, VAD, and STT share one stream
 - Barge-in/interruption handling with echo suppression
-- Chatterbox neural TTS cloned from `chatterbox_emotion_test.wav`
-  (opt-in via `speech.tts_engine: "chatterbox"`; default is the fast local
-  `say` voice for interactive latency -- see `docs/tts_latency_optimization.md`)
+- Kokoro local neural TTS (configured default; requires the optional Kokoro
+  package and local model assets)
+- `say` and Chatterbox remain selectable through `speech.tts_engine`
 
 ### Intelligence
 - Provider-agnostic model layer (`jarvis/providers/`, `jarvis/model_layer.py`)
@@ -87,9 +89,10 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Then edit `.env` — `GEMINI_API_KEY` is required (Google AI Studio);
-`OPENROUTER_API_KEY` and `OPENCODE_ZEN_API_KEY` are optional and widen the
-model pool. See `.env.example`.
+Then configure at least one enabled provider in `.env` (or export its
+credential in the environment). Gemini, OpenRouter, and OpenCode Zen keys are
+checked against enabled models; an unused provider key is not required. See
+`.env.example`.
 
 Run:
 
@@ -102,8 +105,10 @@ python -m jarvis --test     # integration checks
 ```
 
 Voice and webcam are opt-in via `config.yaml`
-(`wake_word.enabled`, `vision.webcam.enabled`). While off, no microphone
-or camera is opened.
+(`wake_word.enabled`, `vision.webcam.enabled`). With voice disabled, the
+default startup enters typed mode and does not open a microphone. `--text`
+always stays typed; `--no-wake` explicitly selects voice input without a wake
+phrase.
 
 ## Configuration
 
@@ -111,6 +116,9 @@ All behaviour lives in `config.yaml`; secrets live only in `.env`
 (never committed). Key knobs: model registry and routing weights, TTS voice
 and expressiveness, VAD thresholds, conversation follow-up window,
 conversation-state decay, proactive gating, and vision sampling/cooldowns.
+Directory listing is restricted to the resolved `file_access.allowed_roots`
+(defaults: the project and its `data` directory); symlink targets outside
+those roots are hidden.
 
 ## Tests
 

@@ -11,6 +11,7 @@ Runs offline against the existing mock providers and a temporary SQLite file.
 """
 
 import base64
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -341,6 +342,20 @@ class TestVisionBehavior:
 # ============================================================================
 
 class TestVisualMemory:
+    def test_generic_fact_wording_does_not_retire_unrelated_legacy_facts(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, fact TEXT NOT NULL, category TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.executemany("INSERT INTO memories (fact) VALUES (?)", [
+            ("User likes tea",), ("User uses vim",),
+        ])
+        conn.commit()
+        conn.close()
+
+        migrated = memory.init_memory_db(path)
+        assert set(memory.recall_all(migrated)) == {"User likes tea", "User uses vim"}
+        migrated.close()
+
     def test_image_alone_stores_nothing(self, _isolated):
         layer = _vision_layer("described it")
         brain = JarvisBrain(model_layer=layer)
@@ -383,6 +398,20 @@ class TestVisualMemory:
         forgotten = memory.forget_matching(db, "MySQL")
         assert forgotten
         assert memory.recall_relevant(db, "what database does atlas use") == []
+
+    def test_ambiguous_forget_does_not_deactivate_multiple_facts(self, db):
+        memory.remember(db, "Atlas uses MySQL", "project")
+        memory.remember(db, "Beacon uses MySQL", "project")
+        assert set(memory.find_matching(db, "MySQL")) == {
+            "Atlas uses MySQL", "Beacon uses MySQL",
+        }
+        assert memory.forget_matching(db, "MySQL") == []
+        assert len(memory.recall_all(db)) == 2
+
+    def test_meaningless_short_forget_query_is_rejected(self, db):
+        memory.remember(db, "Atlas runs a", "project")
+        assert memory.forget_matching(db, "a") == []
+        assert len(memory.recall_all(db)) == 1
 
     def test_irrelevant_visual_memory_is_not_injected(self, db):
         memory.remember(db, "Atlas architecture diagram shows three services", "project")

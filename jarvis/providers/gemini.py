@@ -238,11 +238,18 @@ class GeminiProvider(ModelProvider):
     ) -> ChatSession:
         from google.genai import types
 
+        # The turn's remaining budget, applied per request. The SDK expresses
+        # this in milliseconds on the request config, which is the only place a
+        # Gemini deadline can live.
+        timeout = options.get("timeout")
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=options.get("temperature", 0.7),
             max_output_tokens=options.get("max_output_tokens", 1024),
             tools=tools or None,
+            http_options=(
+                types.HttpOptions(timeout=int(timeout * 1000)) if timeout else None
+            ),
         )
 
         client = _get_client(self.api_key)

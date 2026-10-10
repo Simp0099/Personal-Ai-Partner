@@ -42,7 +42,9 @@ class ScriptedSession(ChatSession):
         self._history = list(history or [])
         self._calls = calls
 
-    def send_message(self, payload: Dict[str, Any]) -> ModelResponse:
+    def send_message(
+        self, payload: Dict[str, Any], timeout: Optional[float] = None
+    ) -> ModelResponse:
         self._calls.append(payload)
         result = self._behaviour(self._history, payload)
 

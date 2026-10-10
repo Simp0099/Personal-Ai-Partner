@@ -90,9 +90,10 @@ _STRUCTURED = {
 _TOOL = {
     "weather", "temperature", "search", "google", "youtube", "wikipedia",
     "screenshot", "play", "music", "email", "send", "open", "launch",
-    "nasa", "apod", "directory", "files", "system status", "look up",
+    "nasa", "apod", "astronomy", "directory", "files", "system status", "look up",
     "browse", "download", "install", "run", "execute", "check my",
     "my computer", "my system", "current time", "what time",
+    "humidity", "forecast", "umbrella", "jacket",
 }
 
 _CASUAL = {

@@ -6,6 +6,10 @@ assistant:
   greeting_name: "Boss"
   default_language: "en-in"
 
+# Directory listing is read-only and restricted to these resolved roots.
+file_access:
+  allowed_roots: [".", "data"]
+
 llm:
   provider: "gemini"
   model: "gemini-3.6-flash"
@@ -271,7 +275,10 @@ routing:
   cooldown_seconds: 60       # base backoff after a retryable failure
   max_attempts: 4            # max models tried in one request before failing
   probe_cooling_models: true # retry the nearest-to-expiry model instead of deadlocking
-  prefer_free: true
+  # Consecutive 429s after which a model counts as having spent its daily quota
+  # and is parked until the provider's reset, rather than burning the remaining
+  # quota on retries. null disables the cap.
+  daily_request_cap: 5
   latency_reference_ms: 4000 # latency at which the latency score reaches ~0.5
 
 debug:
@@ -304,28 +311,13 @@ locations:
   default_maps_query: "Delhi"
 
 speech:
-  # TTS Engine: "say" (default, fast macOS voice for interactive responses),
-  # "chatterbox" (voice-cloned from a reference WAV, slow -- opt-in),
-  # "kokoro" (legacy) or "pyttsx3" (basic platform TTS).
-  # Trade-off: "say" uses a system voice (say_voice), NOT the Chatterbox
-  # clone. Choose "chatterbox" when voice identity matters more than latency.
-  tts_engine: "say"
-  say_voice: "Samantha"      # macOS voice for the "say" engine (see `say -v '?'`)
-  # Chatterbox voice identity. Path relative to the project root (this repo's
-  # Model/ directory); an absolute path also works.
-  chatterbox_reference_audio: "chatterbox_emotion_test.wav"
-  chatterbox_device: "auto"    # auto -> mps/cuda when available, else cpu
-  chatterbox_exaggeration: 0.5
-  chatterbox_cfg_weight: 0.5
-  chatterbox_temperature: 0.8
-  # What to do if Chatterbox fails: "console" (default, text only) or "pyttsx3".
-  # Chatterbox never silently falls back to Kokoro.
-  chatterbox_fallback_engine: "console"
-  # Legacy Kokoro settings (unused unless tts_engine is set back to "kokoro")
-  kokoro_voice: "am_adam"     # Voices: am_adam, am_michael, af_sarah, af_bella, bf_emma, bm_george
-  kokoro_lang: "a"           # 'a' for American English, 'b' for British English
-  kokoro_speed: 1.0          # Speed multiplier (e.g. 1.0, 1.1)
+  tts_engine: "kokoro"
+  kokoro_voice: "af_heart"
+  kokoro_lang: "a"
+  kokoro_speed: 1.0
   pyttsx3_rate: 180
+  asr_engine: "local"
+  asr_timeout_seconds: 15
 
 # ============================================================================
 # Voice (Phase 4) — wake word, endpointing, conversation window
@@ -334,7 +326,7 @@ speech:
 # microphone is never opened, the wake-word model is never loaded, and voice
 # turns nothing off: text conversation is unaffected either way.
 wake_word:
-  enabled: false
+  enabled: true
   model: "hey_jarvis"        # Pre-trained model: hey_jarvis, hey_mycroft, alexa, etc.
   threshold: 0.5             # Confidence threshold (0.0-1.0), higher = more strict
   # Assistant speech ignored after playback stops, so the tail of a reply cannot
@@ -378,6 +370,7 @@ conversation:
   frame_ms: 80               # 80ms frames (~200 wake-word inferences/second)
   tts_chunk_ms: 220          # speech synthesis chunk size
   # input_device: 1          # microphone index; omit for the system default
+  # output_device: 2         # speaker index; omit for the system default
 
 # ============================================================================
 # Conversation state (Phase 5) -- how JARVIS is talking right now

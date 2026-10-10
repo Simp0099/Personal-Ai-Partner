@@ -1,10 +1,10 @@
-"""Phase 4 — one microphone, shared by wake word, VAD and ASR.
+"""One microphone shared by VAD and ASR.
 
 The rule this module exists to enforce: **exactly one process opens the
 microphone.** Previously the wake-word listener and
-`speech.listen()` could open two capture streams through
-``speech_recognition.Microphone`` — two owners of one device, which is how you
-get "device busy" failures on some machines and a silent mic on others.
+`speech.listen()` could open two capture streams through ``speech_recognition.Microphone``
+— two owners of one device, which is how you get "device busy" failures on some
+machines and a silent mic on others.
 
 ```text
 Microphone  ->  MicrophoneStream  ->  [sinks: wake word, VAD, ASR]
@@ -21,9 +21,11 @@ fake microphone and no audio hardware.
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
+import math
+import os
+import queue
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -244,8 +246,9 @@ class VoiceActivityDetector:
             self._silence_ms += frame_ms
             if self._silence_ms >= self.end_silence_ms:
                 audio = bytes(self._buffer)
+                peak = self._peak
                 self.reset()
-                return SpeechEvent("end", now, audio, self._peak)
+                return SpeechEvent("end", now, audio, peak)
         return None
 
 
@@ -319,8 +322,17 @@ class EchoCanceller:
     HISTORY_S = 2.0
 
     def __init__(self, *, rate: int = SAMPLE_RATE, history_s: float = HISTORY_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 playback_rate: Optional[int] = None):
         self.rate = int(rate)
+        #: The rate the played audio was synthesised at. Phase B moved speech
+        #: output to 24 kHz while capture stayed at 16 kHz, so these are no
+        #: longer the same number and the far end must be resampled to be
+        #: comparable with a captured frame at all.
+        self.playback_rate = int(playback_rate or rate)
+        g = math.gcd(self.playback_rate, self.rate) or 1
+        self._up = max(1, self.rate // g)
+        self._down = max(1, self.playback_rate // g)
         self.history_s = float(history_s)
         self.clock = clock
         self._history: List[Any] = []          # [(start_time, float32 array)]
@@ -336,7 +348,7 @@ class EchoCanceller:
 
     def play_reference(self, pcm: bytes) -> None:
         """Record audio about to be played, stamped with when it starts."""
-        if not pcm:
+        if not pcm or len(pcm) % 2:
             return
         samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
         self._history.append((self.clock(), samples))
@@ -390,24 +402,53 @@ class EchoCanceller:
         return max(0.0, min(best_gain, 4.0))
 
     def _reference(self, start: float, end: float):
-        """Reference samples for [start, end), zero where nothing was played."""
+        """Reference samples for [start, end) at the capture rate, zero where nothing
+        was played.
+
+        The played audio is stored at `playback_rate`, which after Phase B is not
+        the capture rate. A 16 kHz microphone hearing a 24 kHz speaker captures a
+        downsampled copy, so the reference has to be resampled before it can be
+        compared with a captured frame. Without this the projection is computed
+        against the wrong samples, the estimated gain collapses to ~0, and the
+        assistant hears its own voice as user speech.
+        """
         count = int((end - start) * self.rate)
-        out = np.zeros(max(count, 0), dtype=np.float32)
         if count <= 0:
+            return np.zeros(0, dtype=np.float32)
+        if self._up == self._down:
+            out = np.zeros(count, dtype=np.float32)
+            times = np.linspace(start, end, count, endpoint=False, dtype=np.float64)
+            for played_at, samples in self._history:
+                n = len(samples)
+                if played_at + n / self.rate < start or played_at > end:
+                    continue
+                positions = (times - played_at) * self.rate
+                valid = (positions >= 0) & (positions < n)
+                if not valid.any():
+                    continue
+                out[valid] += samples[positions[valid].astype(np.int64)]
             return out
-        times = np.linspace(start, end, count, endpoint=False, dtype=np.float64)
+
+        from scipy.signal import resample_poly
+
+        wide = int((end - start) * self.playback_rate)
+        if wide <= 0:
+            return np.zeros(count, dtype=np.float32)
+        buf = np.zeros(wide, dtype=np.float32)
+        times = np.linspace(start, end, wide, endpoint=False, dtype=np.float64)
         for played_at, samples in self._history:
             n = len(samples)
-            if played_at + n / self.rate < start or played_at > end:
+            if played_at + n / self.playback_rate < start or played_at > end:
                 continue
-            # Map absolute time onto this chunk's own sample index.
-            positions = (times - played_at) * self.rate
+            positions = (times - played_at) * self.playback_rate
             valid = (positions >= 0) & (positions < n)
             if not valid.any():
                 continue
-            indices = positions[valid].astype(np.int64)
-            out[valid] += samples[indices]
-        return out
+            buf[valid] += samples[positions[valid].astype(np.int64)]
+        out = resample_poly(buf, self._up, self._down).astype(np.float32)
+        if len(out) < count:
+            out = np.pad(out, (0, count - len(out)))
+        return out[:count]
 
     # -- near end --------------------------------------------------------
 
@@ -422,7 +463,7 @@ class EchoCanceller:
 
     def cancel(self, pcm: bytes) -> bytes:
         """Return `pcm` with the assistant's own playback removed."""
-        if not pcm:
+        if not pcm or len(pcm) % 2:
             return pcm
         frame = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
         if not self._history:
@@ -539,18 +580,12 @@ class MicrophoneUnavailable(RuntimeError):
 
 
 class SoundDeviceSource:
-    """Microphone capture through sounddevice (PortAudio).
-
-    The device callback pushes frames into a bounded queue. read() blocks until a
-    frame arrives or the timeout expires. A timeout returns None, which is normal.
-    Any other failure raises, so the caller can see it.
-    """
-
+    """Microphone capture through sounddevice with a bounded callback queue."""
     def __init__(self, device=None, rate=SAMPLE_RATE, frame_ms=AUDIO_FRAME_MS, max_queued=200):
         self.device = device
         self.rate = int(rate)
-        self.block = int(self.rate * frame_ms / 1000)   # samples per frame
-        self.frame_size = self.block * 2                 # bytes per frame, int16 mono
+        self.block = int(self.rate * frame_ms / 1000)
+        self.frame_size = self.block * 2
         self._queue = queue.Queue(maxsize=max_queued)
         self._stream = None
         self.device_name = ""
@@ -564,32 +599,22 @@ class SoundDeviceSource:
         try:
             import sounddevice as sd
         except ImportError as e:
-            raise MicrophoneUnavailable(
-                "sounddevice is not installed. Run: pip install sounddevice") from e
-
+            raise MicrophoneUnavailable("sounddevice is not installed. Run: pip install sounddevice") from e
         try:
             info = sd.query_devices(self.device, "input")
-        except Exception as e:
-            raise MicrophoneUnavailable(f"no input device found: {e}") from e
-        self.device_name = info.get("name", "unknown")
-
-        try:
+            self.device_name = info.get("name", "unknown")
             self._stream = sd.InputStream(
-                samplerate=self.rate,
-                channels=1,
-                dtype="int16",
-                blocksize=self.block,
-                device=self.device,
-                callback=self._callback,
+                samplerate=self.rate, channels=1, dtype="int16", blocksize=self.block,
+                device=self.device, callback=self._callback,
             )
             self._stream.start()
         except Exception as e:
             self._stream = None
             raise MicrophoneUnavailable(
-                f"could not open '{self.device_name}': {e}. On macOS, allow your terminal "
-                "under System Settings > Privacy and Security > Microphone."
+                f"Could not open microphone '{self.device_name or self.device}': {e}. "
+                "On macOS, allow your terminal under System Settings > Privacy and Security > Microphone."
             ) from e
-        logger.info(f"[AUDIO] microphone: {self.device_name}")
+        logger.info("[AUDIO] microphone: %s", self.device_name)
 
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -598,7 +623,6 @@ class SoundDeviceSource:
         try:
             self._queue.put_nowait(chunk)
         except queue.Full:
-            # Keep the newest audio: drop the oldest frame instead of blocking the device.
             self.overflows += 1
             try:
                 self._queue.get_nowait()
@@ -619,7 +643,7 @@ class SoundDeviceSource:
                 stream.stop()
                 stream.close()
             except Exception as e:  # noqa: BLE001
-                logger.debug(f"microphone close reported: {e}")
+                logger.debug("microphone close reported: %s", e)
         while True:
             try:
                 self._queue.get_nowait()
@@ -652,13 +676,15 @@ class MicrophoneStream:
         self.frames_read = 0
         self.available = False
         self.last_error: Optional[str] = None
+        self._last_empty_read_diag = 0.0
 
     # -- wiring ----------------------------------------------------------
 
     def add_sink(self, sink: Callable[[bytes], None]) -> None:
         """Register a consumer of raw frames."""
         with self._lock:
-            self._sinks.append(sink)
+            if sink not in self._sinks:
+                self._sinks.append(sink)
 
     def remove_sink(self, sink: Callable[[bytes], None]) -> None:
         with self._lock:
@@ -671,7 +697,12 @@ class MicrophoneStream:
         """Open the device and start pumping frames. Honest False on failure."""
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
+                if self._stop.is_set():
+                    raise RuntimeError("previous microphone reader is still stopping")
                 return True
+            if self._thread is not None:
+                self.source.close()
+                self._thread = None
             try:
                 self.source.open()
             except Exception as e:  # noqa: BLE001 - unavailability is not a crash
@@ -684,20 +715,33 @@ class MicrophoneStream:
             self._stop.clear()
             self.available = True
             self.last_error = None
+            self._last_empty_read_diag = self.clock()
             self._thread = threading.Thread(target=self._pump, name="microphone", daemon=True)
             self._thread.start()
-        logger.info("[AUDIO] microphone open (one stream, shared by wake word, VAD and ASR)")
+        logger.info(
+            "[AUDIO] microphone stream active pid=%d device=%s index=%s rate=%d channels=%d "
+            "format=int16 frame=%d samples/%dms",
+            os.getpid(), getattr(self.source, "device_name", None) or "configured/default input",
+            getattr(self.source, "device", None), SAMPLE_RATE, AUDIO_CHANNELS,
+            int(SAMPLE_RATE * AUDIO_FRAME_MS / 1000), AUDIO_FRAME_MS,
+        )
         return True
 
     def stop(self, timeout: float = 3.0) -> None:
         """Stop pumping and release the device. Idempotent."""
         self._stop.set()
         with self._lock:
-            thread, self._thread = self._thread, None
+            thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
-        self.source.close()
-        self.available = False
+            if thread.is_alive():
+                raise TimeoutError("microphone reader did not stop; device remains open")
+        with self._lock:
+            if thread is not self._thread:
+                raise RuntimeError("microphone owner changed during shutdown")
+            self.source.close()
+            self._thread = None
+            self.available = False
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -706,7 +750,7 @@ class MicrophoneStream:
     # -- reading ---------------------------------------------------------
 
     def _pump(self) -> None:
-        """Read loop. Failures are counted, logged, and retried. They are never hidden."""
+        """Read loop that reports repeated capture failures instead of hiding them."""
         failures = 0
         while not self._stop.is_set():
             try:
@@ -714,24 +758,39 @@ class MicrophoneStream:
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 self.last_error = f"read failed: {e}"
-                logger.error(f"[AUDIO] microphone read failed ({failures}): {e}")
+                logger.error("[AUDIO] microphone read failed (%d): %s", failures, e)
                 if failures >= 20:
-                    self.available = False
-                    logger.error("[AUDIO] giving up on the microphone after repeated read failures")
+                    self._fail("giving up on the microphone after repeated read failures")
                     return
                 time.sleep(min(0.05 * failures, 0.5))
                 continue
-            if pcm is None:          # timeout with no audio is normal: keep waiting
+            if pcm is None:
                 continue
             failures = 0
+            if not isinstance(pcm, (bytes, bytearray, memoryview)) or len(pcm) != frame_bytes():
+                self._fail(
+                    f"microphone returned malformed frame: expected {frame_bytes()} bytes "
+                    f"of {SAMPLE_RATE} Hz mono int16 PCM"
+                )
+                return
             self.frames_read += 1
             with self._lock:
                 sinks = list(self._sinks)
             for sink in sinks:
                 try:
                     sink(pcm)
-                except Exception as e:  # noqa: BLE001 - one bad sink, not the mic
-                    logger.warning(f"[AUDIO] sink failed: {e}")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[AUDIO] sink failed: %s", e)
+
+    def _fail(self, message: str) -> None:
+        self.last_error = message
+        self.available = False
+        logger.error("[AUDIO] %s", message)
+        if self.on_error:
+            try:
+                self.on_error(message)
+            except Exception:
+                logger.exception("[AUDIO] microphone error callback failed")
 
     # -- diagnostics -----------------------------------------------------
 
@@ -743,6 +802,8 @@ class MicrophoneStream:
             "sinks": len(self._sinks),
             "sample_rate": SAMPLE_RATE,
             "frame_ms": AUDIO_FRAME_MS,
+            "device_index": getattr(self.source, "device", None),
+            "device_name": getattr(self.source, "device_name", None),
             "last_error": self.last_error,
         }
 

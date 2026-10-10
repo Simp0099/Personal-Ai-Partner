@@ -46,7 +46,7 @@ def _build_routing_config(raw: Dict[str, Any]) -> RoutingConfig:
         cooldown_seconds=float(raw.get("cooldown_seconds", 60.0)),
         max_attempts=int(raw.get("max_attempts", 4)),
         probe_cooling_models=bool(raw.get("probe_cooling_models", True)),
-        prefer_free=bool(raw.get("prefer_free", True)),
+        daily_request_cap=raw.get("daily_request_cap"),
         latency_reference_ms=float(raw.get("latency_reference_ms", 4000.0)),
     )
 
@@ -70,6 +70,8 @@ class ModelLayer:
         if routing_config is None:
             routing_config = _build_routing_config(ROUTING_CONFIG)
         self.health.base_backoff = routing_config.cooldown_seconds
+        if routing_config.daily_request_cap:
+            self.health.set_daily_request_cap(routing_config.daily_request_cap)
         self.router = router if router is not None else ModelRouter(
             self.registry, self.health, routing_config
         )
@@ -193,6 +195,7 @@ class ModelLayer:
             },
             "max_attempts": self.router.config.max_attempts,
             "cooldown_seconds": self.router.config.cooldown_seconds,
+            "daily_request_cap": self.router.config.daily_request_cap,
             "models": self.router.status_snapshot(self.providers),
         }
 

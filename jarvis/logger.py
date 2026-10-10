@@ -226,13 +226,14 @@ class StatusIndicator:
 
     @classmethod
     def tool_call(cls, name: str, args: dict):
-        """Indicate a tool is being executed."""
-        logger.info(f"{cls.SYMBOLS['tool']} Executing: {name}({args})")
+        """Log a tool name and argument names without sensitive values."""
+        keys = ", ".join(sorted(str(key) for key in (args or {})))
+        logger.info(f"{cls.SYMBOLS['tool']} Executing: {name} (arguments: {keys or 'none'})")
 
     @classmethod
     def tool_result(cls, name: str, result: str):
-        """Indicate a tool has returned a result."""
-        logger.debug(f"{cls.SYMBOLS['tool']} {name} returned: {result[:100]}")
+        """Record completion without placing tool output in the log."""
+        logger.debug(f"{cls.SYMBOLS['tool']} {name} returned ({len(str(result or ''))} characters)")
 
     @classmethod
     def wake_detected(cls, confidence: float):

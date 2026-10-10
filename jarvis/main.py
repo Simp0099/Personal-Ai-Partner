@@ -143,7 +143,6 @@ def run_assistant() -> None:
     wish_me()
     brain = JarvisBrain()
     start_perception(brain)
-    voice = start_voice(brain)
     machine = get_assistant_machine()
 
     try:
@@ -181,76 +180,27 @@ def run_assistant() -> None:
         stop_perception()
 
 
-def run_wake_word_mode() -> None:
-    """Wake word activated mode using openWakeWord.
-
-    Continuously listens for the wake word in the background.
-    When detected, activates the assistant to listen for a command.
-    """
-    from jarvis.wake_word import WakeWordListener
-
+def run_voice_mode() -> None:
+    """Voice mode: one microphone, one conversation loop, runs until Ctrl+C."""
+    import time
+    from jarvis import tts
+    from jarvis.voice_loop import start_voice_loop
     set_interactive_prompting(True)
     brain = JarvisBrain()
-    shutdown_requested = threading.Event()
-
-    def on_wake():
-        """Called when wake word is detected."""
-        machine = get_assistant_machine()
-        _to(machine, AssistantState.SPEAKING, "wake acknowledged")
-        speak("Yes, Boss?")
-        _to(machine, AssistantState.LISTENING, "awaiting input")
-        query = listen().strip()
-
-        if not query or query.lower() == "none":
-            machine.recover("no input")
-            return
-
-        if is_shutdown_request(query):
-            StatusIndicator.shutdown()
-            speak(f"Going offline. You can call me anytime, {GREETING_NAME}!")
-            machine.recover("shutdown")
-            shutdown_requested.set()
-            return
-
-        _to(machine, AssistantState.PROCESSING, "request accepted")
-        try:
-            response = brain.ask(query)
-            _to(machine, AssistantState.SPEAKING, "response ready")
-            speak(response)
-            machine.transition_to(AssistantState.IDLE, "turn complete")
-        except BrainError as e:
-            logger.error(f"Model unavailable: {e.detail or e}")
-            speak(e.message)
-            machine.recover("provider failure")
-        except Exception as e:
-            logger.error(f"Error processing wake command: {e}", exc_info=True)
-            speak("I encountered an issue processing that command, Boss.")
-            machine.recover("processing error")
-
-    print(f"\n{'='*60}")
-    print(f"  {ASSISTANT_NAME} 2.0 — Wake Word Mode")
-    print(f"  Model: {LLM_MODEL}")
-    print(f"{'='*60}")
-    print(f"\nSay 'hey jarvis' to activate. Type Ctrl+C to exit.\n")
-
-    listener = WakeWordListener(on_wake=on_wake)
     start_perception(brain)
-    voice = start_voice(brain)
-
+    tts.warm_up()
+    loop = start_voice_loop(brain, force=True)
+    if loop is None:
+        print("Voice is unavailable. The log has the reason. Use --text for typed chat.")
+        stop_perception()
+        return
+    print(f"\n{ASSISTANT_NAME} is listening. Press Ctrl+C to quit.\n", flush=True)
     try:
-        # Detection clears is_listening before its callback starts. Join the
-        # worker through TTS and audio cleanup, then arm the next wake.
-        while not shutdown_requested.is_set():
-            listener.start()
-            listener.join()
+        while loop.is_running():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         logger.info("Session ended by user.")
-        sys.exit(0)
     finally:
-        listener.stop()
-        # Release audio and camera before the process goes down. Freeing a
-        # native handle while another thread still holds it is exactly what the
-        # previous shutdown race looked like.
         stop_voice()
         stop_perception()
 
@@ -273,7 +223,6 @@ def run_text_mode() -> None:
     set_interactive_prompting(True)
     brain = JarvisBrain()
     start_perception(brain)
-    start_voice(brain)
     machine = get_assistant_machine()
 
     while True:
@@ -517,16 +466,9 @@ if __name__ == "__main__":
         run_verification_test()
     elif "--text" in args:
         run_text_mode()
-    elif "--no-wake" in args:
-        try:
-            run_assistant()
-        except KeyboardInterrupt:
-            logger.info("Session ended by user.")
-            sys.exit(0)
     else:
-        # Default: wake word mode
         try:
-            run_wake_word_mode()
+            run_voice_mode()
         except KeyboardInterrupt:
             logger.info("Session ended by user.")
             sys.exit(0)

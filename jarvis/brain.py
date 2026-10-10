@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from jarvis.config import (
     MAX_TOOL_ROUNDS,
     MAX_HISTORY_MESSAGES,
+    REQUEST_TIMEOUT_S,
     DEBUG_INPUT,
     JARVIS_SYSTEM_PROMPT,
     DEFAULT_CITY,
@@ -267,25 +268,27 @@ def open_maps(location: str = "Delhi") -> str:
     return web.open_maps(location)
 
 
-def get_temperature(city: str = "Delhi") -> str:
-    """Check the current temperature and weather for a city.
+def get_weather(city: str = "") -> str:
+    """Check the current weather for a city: temperature, conditions and range.
 
     Args:
-        city: Name of the city (e.g. Delhi, London, Tokyo).
+        city: Name of the city (e.g. Delhi, London, Tokyo). Defaults to the
+            configured city when omitted.
     """
-    return weather.get_temperature(city or DEFAULT_CITY)
+    return weather.get_weather(city or DEFAULT_CITY)
 
 
 def get_nasa_apod(date: str = None) -> str:
-    """Fetch NASA Astronomy Picture of the Day and space facts for a given date.
+    """Fetch NASA's Astronomy Picture of the Day: title, summary and image link.
 
     Args:
-        date: Date in YYYY-MM-DD format, or None for today.
+        date: Date in YYYY-MM-DD format, or None for today. Dates with no
+            picture available return NASA's most recent one instead.
     """
     data = nasa.get_nasa_apod(date)
-    if data:
-        return f"Title: {data.get('title')}. Explanation: {data.get('explanation')}"
-    return "Could not fetch space news."
+    if not data:
+        return "NASA's astronomy picture service is not responding right now."
+    return f"{nasa.format_apod(data)}\n\n{nasa.summarize_apod(data)}"
 
 
 def take_screenshot(filename: str = None) -> str:
@@ -304,8 +307,7 @@ def play_music(song_name: str) -> str:
     Args:
         song_name: Name of the track or artist to play.
     """
-    media.play_music(song_name)
-    return f"Playing '{song_name}' on YouTube."
+    return media.play_music(song_name)
 
 
 def lookup_dictionary(word: str) -> str:
@@ -317,16 +319,21 @@ def lookup_dictionary(word: str) -> str:
     return dictionary_tool.get_meaning(word)
 
 
-def send_email(to_address: str, subject: str, message: str) -> str:
-    """Send an email via SMTP.
+def send_email(to_address: str, subject: str, message: str,
+               confirmed: bool = False) -> str:
+    """Send an email over SMTP.
+
+    Call with ``confirmed=false`` first: that returns a refusal telling you to
+    ask the user. Only after the user has said yes in a later message should
+    you call it again with ``confirmed=true`` and the identical arguments.
 
     Args:
         to_address: Recipient email address.
         subject: Subject line of the email.
         message: Body content of the email.
+        confirmed: True only once the user explicitly approved this exact send.
     """
-    success = email_tool.send_email(to_address, subject, message)
-    return "Email sent successfully." if success else "Failed to send email. Check credentials."
+    return email_tool.send_email(to_address, subject, message, confirmed=confirmed)
 
 
 def tell_time() -> str:
@@ -439,6 +446,11 @@ def forget_memory(query: str) -> str:
                 StatusIndicator.memory(f"Forgotten: '{fact}'")
             listed = "; ".join(forgotten)
             return f"Forgotten and no longer retrieved: {listed}"
+        candidates = memory.find_matching(conn, query)
+        if candidates:
+            return "Several memories match. Please specify one fact to forget: " + "; ".join(candidates)
+        if len(query.strip()) < 3:
+            return "Please give at least three meaningful characters so I can identify the memory safely."
         return f"Nothing in memory matched '{query}', so nothing was forgotten."
     except Exception as e:
         logger.error(f"forget_memory failed: {e}", exc_info=True)
@@ -490,7 +502,7 @@ GEMINI_TOOLS = [
     search_youtube,
     search_google,
     open_maps,
-    get_temperature,
+    get_weather,
     get_nasa_apod,
     take_screenshot,
     play_music,
@@ -558,6 +570,9 @@ class JarvisBrain:
         #: memory.
         self._ephemeral = False
         self._message_count = 0
+        #: Wall-clock deadline for the current turn, shared by every provider
+        #: call in it. None outside a turn.
+        self._turn_deadline: Optional[float] = None
         # One in-flight request per conversation, so overlapping requests cannot
         # interleave and reorder the user's messages.
         self._lock = threading.Lock()
@@ -584,7 +599,11 @@ class JarvisBrain:
             raise BrainError(f"Unknown model '{model}'.", detail=f"unknown model key {model!r}")
         return spec
 
-    def _create_chat(self, model: Any, history: Optional[List[Dict[str, Any]]] = None) -> ChatSession:
+    def _create_chat(
+        self,
+        model: Any,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> ChatSession:
         """Open a provider session for `model`, seeded with prior history.
 
         The Phase 1 identity prompt is cached on the instance and reused for the
@@ -615,7 +634,9 @@ class JarvisBrain:
             # actor: it may not write memory, send mail, or open a browser.
             tools=[] if self._ephemeral else GEMINI_TOOLS,
             history=list(history or []),
-            **self.layer.options_for(spec),
+            # Whatever is left of this turn's budget, not a fresh per-call
+            # allowance: a tool loop must not restart the clock each round.
+            **self.layer.options_for(spec, timeout=self._turn_deadline_seconds()),
         )
         self._session = session
         self._model_key = spec.key
@@ -648,6 +669,7 @@ class JarvisBrain:
         self._turn_context = ""
         self._ephemeral = False
         self._message_count = 0
+        self._turn_deadline = None
         # A clean slate is a new conversation, so the conversational state goes
         # with the history rather than describing a conversation that no longer
         # exists.
@@ -658,8 +680,15 @@ class JarvisBrain:
         self._history.extend(messages)
         self._message_count += len(messages)
         cap = MAX_HISTORY_MESSAGES * 2
-        if len(self._history) > cap:
-            self._history = self._history[-cap:]
+        while len(self._history) > cap:
+            next_turn = next(
+                (i for i, item in enumerate(self._history[1:], 1)
+                 if item.get("role") == "user"),
+                None,
+            )
+            if next_turn is None:
+                break  # Keep the complete current turn, even if unusually large.
+            del self._history[:next_turn]
 
     def _history_has_images(self) -> bool:
         """Whether any earlier turn in this conversation carried an image.
@@ -681,6 +710,10 @@ class JarvisBrain:
 
         keep = max(2, MAX_HISTORY_MESSAGES)
         window = self._history[-keep:]
+        first_user = next((i for i, item in enumerate(window)
+                           if item.get("role") == "user"), None)
+        if first_user is not None:
+            window = window[first_user:]
         logger.info(
             f"[BRAIN] session={self.conversation_id} trimming history to "
             f"{len(window)} most recent turns"
@@ -822,6 +855,7 @@ class JarvisBrain:
                         if ephemeral:
                             self._turn_context = saved_context
             finally:
+                self._turn_deadline = None
                 # Single finish point: local hits set route above, provider
                 # turns are recognized by their request spans. Voice-owned
                 # traces are finished by the voice loop, not here.
@@ -899,7 +933,10 @@ class JarvisBrain:
         attempts = ranked[: max(1, self.layer.router.config.max_attempts)]
         failures: List[str] = []
         executed_this_turn: Dict[str, str] = {}
-        turn_messages: List[Dict[str, Any]] = []
+        # One budget for the whole turn, not per model. A chain of four slow
+        # models must not be able to hold the user for four timeouts.
+        self._turn_deadline = _now() + REQUEST_TIMEOUT_S
+        deadline = self._turn_deadline
 
         for attempt, candidate in enumerate(attempts, 1):
             spec = candidate.spec
@@ -914,7 +951,9 @@ class JarvisBrain:
                 # An ephemeral turn starts a clean session: the user's history
                 # has no business in a camera analysis, and perception is not a
                 # turn of this conversation.
-                session = self._create_chat(spec, history=[] if ephemeral else self._history)
+                session = self._create_chat(
+                    spec, history=[] if ephemeral else self._history
+                )
                 payload = {"kind": "user", "text": message}
                 if images:
                     payload["images"] = images
@@ -937,6 +976,9 @@ class JarvisBrain:
             latency = _now() - started
             self.layer.record_success(spec, latency)
             self.last_model_key = spec.key
+            # Tool exchanges from a failed provider attempt must not leak into
+            # the next candidate's committed conversation history.
+            turn_messages: List[Dict[str, Any]] = []
 
             if DEBUG_INPUT:
                 logger.info(f"[MODEL OUTPUT] session={self.conversation_id} model={spec.key} "
@@ -949,6 +991,7 @@ class JarvisBrain:
                     response=response,
                     turn_messages=turn_messages,
                     executed_this_turn=executed_this_turn,
+                    deadline=deadline,
                 )
             except ProviderError as e:
                 self.layer.record_failure(spec, e)
@@ -974,6 +1017,17 @@ class JarvisBrain:
 
         raise BrainError(_friendly_error_message_from_failures(failures), detail="; ".join(failures))
 
+    def _turn_deadline_seconds(self) -> float:
+        """Seconds left in this turn's budget, floored so a call still goes out.
+
+        A turn that has already overrun passes 1s: returning 0 would let a
+        provider treat "no time" as "no limit", which is the opposite of the
+        point.
+        """
+        if self._turn_deadline is None:
+            return REQUEST_TIMEOUT_S
+        return max(1.0, self._turn_deadline - _now())
+
     def _reset_after_failure(self) -> None:
         """Drop the failed session so the next candidate starts clean."""
         if self._session is not None:
@@ -992,6 +1046,7 @@ class JarvisBrain:
         response: ModelResponse,
         turn_messages: List[Dict[str, Any]],
         executed_this_turn: Dict[str, str],
+        deadline: float,
     ) -> str:
         """Serve tool requests until the model returns text.
 
@@ -1007,11 +1062,31 @@ class JarvisBrain:
             if not response.has_tool_calls:
                 break
 
-            if round_index == MAX_TOOL_ROUNDS - 1:
+            # Two reasons to stop, told apart because they mean different
+            # things to the user: a runaway tool loop is our bug, an expired
+            # budget is just a long turn.
+            out_of_time = _now() >= deadline
+            if round_index == MAX_TOOL_ROUNDS - 1 or out_of_time:
+                reason = ("turn time limit reached" if out_of_time
+                          else f"tool round limit ({MAX_TOOL_ROUNDS}) reached")
                 logger.warning(
-                    f"[BRAIN] session={self.conversation_id} hit tool round limit "
-                    f"({MAX_TOOL_ROUNDS}); answering without further tools"
+                    f"[BRAIN] session={self.conversation_id} {reason}; "
+                    f"answering without further tools"
                 )
+                assistant_calls = [{
+                    "id": call.id, "name": call.name,
+                    "arguments": dict(call.arguments or {}),
+                } for call in response.tool_calls]
+                results = [{
+                    "id": call.id, "name": call.name,
+                    "result": f"Error: {reason}; this tool was not executed.",
+                } for call in response.tool_calls]
+                turn_messages.extend((
+                    {"role": "assistant", "content": response.text or "",
+                     "tool_calls": assistant_calls},
+                    {"role": "tool", "results": results},
+                ))
+                executed.extend((call.name, result) for call, result in zip(response.tool_calls, [r["result"] for r in results]))
                 break
 
             results: List[Dict[str, Any]] = []
@@ -1142,7 +1217,13 @@ def _friendly_error_message_from_failures(failures: List[str]) -> str:
         if ":" in failure:
             kinds.add(failure.split(":", 1)[1].strip().split(" ")[0])
     if "rate_limit" in kinds:
-        return "The AI provider's usage limit has been reached. Please try again later."
+        # Every candidate was rate limited, so this is the quota, not one
+        # provider: naming a single one would send the user chasing a key that
+        # was never the problem.
+        return (
+            "Every available model is rate limited right now, so the assistant "
+            "cannot answer until your provider quota resets. Please try again later."
+        )
     if "server" in kinds:
         return "All available AI models are temporarily unavailable. Please try again shortly."
     if "timeout" in kinds:

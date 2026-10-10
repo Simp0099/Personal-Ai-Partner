@@ -44,6 +44,7 @@ class ModelSpec:
     verified: bool = False
     verified_on: str = ""
     notes: str = ""
+    tier: str = "fallback"
     # Free-form task affinity hints, e.g. {"coding": 10}
     task_affinity: Dict[str, int] = field(default_factory=dict)
 
@@ -136,6 +137,7 @@ class ModelRegistry:
                 verified=bool(raw.get("verified", False)),
                 verified_on=str(raw.get("verified_on", "")),
                 notes=str(raw.get("notes", "")),
+                tier=str(raw.get("tier", "fallback")),
                 task_affinity={str(k): int(v) for k, v in (raw.get("task_affinity") or {}).items()},
             ))
 

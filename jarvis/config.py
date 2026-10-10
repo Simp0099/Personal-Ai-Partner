@@ -57,6 +57,24 @@ if CONFIG_FILE.exists() and yaml is not None:
 else:
     CONFIG = {}
 
+# Read-only directory access for the listing tool. Resolve roots once so
+# traversal and symlink targets are checked against canonical paths.
+_file_access = CONFIG.get("file_access", {})
+if not isinstance(_file_access, dict):
+    _file_access = {}
+_allowed_file_roots = _file_access.get("allowed_roots", [".", "data"])
+if not isinstance(_allowed_file_roots, list) or not all(
+    isinstance(root, str) and root.strip() for root in _allowed_file_roots
+):
+    logger.warning("Invalid file_access.allowed_roots; using project and data directories.")
+    _allowed_file_roots = [".", "data"]
+ALLOWED_FILE_ROOTS = tuple(
+    (PROJECT_ROOT / Path(root).expanduser()).resolve()
+    if not Path(root).expanduser().is_absolute()
+    else Path(root).expanduser().resolve()
+    for root in _allowed_file_roots
+)
+
 # Assistant Settings
 ASSISTANT_NAME = CONFIG.get("assistant", {}).get("name", "Ai Partner")
 GREETING_NAME = CONFIG.get("assistant", {}).get("greeting_name", "Boss")
@@ -167,11 +185,36 @@ Execution task: do the work, don't just describe it.
 You have tools — use them whenever a request needs real-world action. Do not expose
 hidden chain-of-thought; give conclusions, reasoning summaries, decisions, assumptions,
 and actionable steps instead.
+
+## Irreversible actions
+Some tools have real-world effects that cannot be undone: sending an email, opening
+a browser, launching an application, taking a screenshot, saving to memory. For these:
+act when the user asked for that specific action, and otherwise confirm first.
+`send_email` in particular starts as `confirmed=false` and returns a refusal — read
+the exact recipient, subject and body back to the user, ask whether to send, and only
+call it again with `confirmed=true` after they clearly agree in a later message.
+Silence, "ok", or ambiguity is not agreement.
+
+Never claim a tool did something unless its result says so. If a result reports a
+failure, say it failed.
 """
 
 # Weather & Locations
 DEFAULT_CITY = CONFIG.get("weather", {}).get("default_city", "Delhi")
 DEFAULT_MAPS_QUERY = CONFIG.get("locations", {}).get("default_maps_query", "Delhi")
+
+# Weather & NASA tool timeouts. Every outbound tool call is bounded: an
+# unbounded request is how one slow API turns into an assistant that never
+# answers.
+WEATHER_TIMEOUT_S = float((CONFIG.get("weather", {}) or {}).get("timeout_seconds", 10))
+NASA_TIMEOUT_S = float((CONFIG.get("space", {}) or {}).get("timeout_seconds", 10))
+
+#: Sent on every outbound HTTP request. Some public APIs (notably wttr.in and
+#: Nominatim) reject requests without one.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 # Contacts Map
 CONTACTS = CONFIG.get("contacts", {}) or {}
@@ -195,27 +238,15 @@ ALLOWED_APPS = _validated_app_allowlist(
 )
 
 # Speech & TTS Settings
-# Chatterbox is the active engine. Paths are relative to PROJECT_ROOT (the repo
-# root, i.e. the Model/ directory) unless absolute.
+# Paths are relative to PROJECT_ROOT (the repo root) unless absolute.
 _SPEECH = CONFIG.get("speech", {}) or {}
 
-TTS_ENGINE = _SPEECH.get("tts_engine", "say")
+TTS_ENGINE = _SPEECH.get("tts_engine", "kokoro")
+REQUEST_TIMEOUT_S = float(ROUTING_CONFIG.get("request_timeout_seconds", 45))
+ASR_ENGINE = str(_SPEECH.get("asr_engine", "google")).strip().lower()
+ASR_TIMEOUT_S = float(_SPEECH.get("asr_timeout_seconds", 15.0))
 
-# macOS `say`: fast local engine, default for interactive responses. The voice
-# is a system voice (not the Chatterbox clone) -- documented trade-off.
-SAY_VOICE = str(_SPEECH.get("say_voice", "Samantha") or "Samantha")
-
-# Chatterbox: voice identity comes from the reference WAV, not from a voice id.
-CHATTERBOX_REFERENCE_AUDIO = _SPEECH.get("chatterbox_reference_audio", "chatterbox_emotion_test.wav")
-CHATTERBOX_DEVICE = _SPEECH.get("chatterbox_device", "auto")  # auto | mps | cuda | cpu
-CHATTERBOX_EXAGGERATION = float(_SPEECH.get("chatterbox_exaggeration", 0.5))
-CHATTERBOX_CFG_WEIGHT = float(_SPEECH.get("chatterbox_cfg_weight", 0.5))
-CHATTERBOX_TEMPERATURE = float(_SPEECH.get("chatterbox_temperature", 0.8))
-# What to do when Chatterbox fails: "console" (default, no audio) or "pyttsx3".
-# There is deliberately no silent fallback to Kokoro.
-CHATTERBOX_FALLBACK_ENGINE = _SPEECH.get("chatterbox_fallback_engine", "console")
-
-# Kokoro: legacy, only used if speech.tts_engine is explicitly set back to "kokoro".
+# Kokoro local TTS.
 KOKORO_VOICE = _SPEECH.get("kokoro_voice", "am_adam")
 KOKORO_LANG = _SPEECH.get("kokoro_lang", "a")
 KOKORO_SPEED = float(_SPEECH.get("kokoro_speed", 1.0))
@@ -372,6 +403,7 @@ AUDIO_SAMPLE_RATE = int(_CONVERSATION.get("sample_rate", 16000))
 AUDIO_CHANNELS = 1
 AUDIO_FRAME_MS = int(_CONVERSATION.get("frame_ms", 80))
 AUDIO_INPUT_DEVICE = _CONVERSATION.get("input_device")   # None = system default
+AUDIO_OUTPUT_DEVICE = _CONVERSATION.get("output_device") # None = system default
 
 # Voice activity detection. Energy over RMS, local and deterministic.
 #: Minimum RMS (0..1) for a frame to count as voiced during normal listening.

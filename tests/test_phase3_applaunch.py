@@ -69,7 +69,6 @@ class TestAllowlistedLaunch:
         seen = []
         monkeypatch.setattr(apps.subprocess, "run",
                             lambda argv, **kw: seen.append((argv, kw)) or _Done())
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         _, response = _ask_blocked("Open WhatsApp")
         assert response == "WhatsApp is now open."
         assert len(seen) == 1
@@ -79,7 +78,6 @@ class TestAllowlistedLaunch:
 
     def test_case_normalization(self, _quiet, _allowlist, monkeypatch):
         monkeypatch.setattr(apps.subprocess, "run", lambda argv, **kw: _Done())
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         _, response = _ask_blocked("open whatsapp")
         assert response == "WhatsApp is now open."
 
@@ -103,7 +101,6 @@ class TestLocalFailures:
     def test_not_installed_is_local_error(self, _quiet, _allowlist, monkeypatch):
         monkeypatch.setattr(apps.subprocess, "run",
                             lambda argv, **kw: _Done(rc=1, err="No such app"))
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         _, response = _ask_blocked("Launch Safari")
         assert "isn't installed" in response
 
@@ -143,7 +140,6 @@ class TestShellSafety:
             return _Done()
 
         monkeypatch.setattr(apps.subprocess, "run", _spy)
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         apps.launch_app("Safari")
         assert seen[0][0][:2] == ["open", "-a"]
 
@@ -168,7 +164,6 @@ class TestShellSafety:
         seen = []
         monkeypatch.setattr(apps.subprocess, "run",
                             lambda argv, **kw: seen.append((argv, kw)) or _Done())
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         apps.launch_app(weird)
         argv, kwargs = seen[0]
         assert argv == ["open", "-a", weird] and "shell" not in kwargs
@@ -196,7 +191,6 @@ class TestAllowlistConfig:
 class TestLogging:
     def test_normal_terminal_clean(self, _quiet, _allowlist, monkeypatch, capsys):
         monkeypatch.setattr(apps.subprocess, "run", lambda argv, **kw: _Done())
-        monkeypatch.setattr(apps, "speak", lambda *a: None)
         _ask_blocked("Open WhatsApp")
         out, err = capsys.readouterr()
         assert out == "" and err == ""
@@ -205,7 +199,6 @@ class TestLogging:
         configure_logging(debug=True)
         try:
             monkeypatch.setattr(apps.subprocess, "run", lambda argv, **kw: _Done())
-            monkeypatch.setattr(apps, "speak", lambda *a: None)
             with caplog.at_level("DEBUG", logger="jarvis"):
                 _ask_blocked("Launch Safari")
             assert any("launch_app" in r.message and "skipped" in r.message

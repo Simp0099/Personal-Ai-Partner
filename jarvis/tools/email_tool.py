@@ -1,24 +1,32 @@
-"""Secure Email tool for JARVIS 2.0.
+"""Secure email tool for JARVIS 2.0.
 
-Uses smtplib with TLS and loads credentials strictly from environment variables.
-Never stores or logs plain text passwords.
+SMTP over TLS, credentials from environment variables only -- never stored,
+never logged.
 
-Phase 8: All errors caught and logged gracefully.
+Two properties matter more than the feature:
+
+* **The body is never logged.** Recipient and subject may be; content never is.
+* **Nothing is sent without an explicit confirmation** on every path. There is
+  no timeout, no default-yes, and no partial match: silence is not consent.
 """
 
+import re
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from jarvis.speech import speak, listen
+from email.mime.text import MIMEText
+
 from jarvis.config import GMAIL_ADDRESS, GMAIL_APP_PASSWORD, CONTACTS
 from jarvis.logger import logger
+from jarvis.providers.base import redact
 
-# Explicit affirmative replies. Anything else -- no, cancel, stop, ambiguous,
-# empty, "none" (non-interactive) -- is unconfirmed and must NOT send.
+#: Explicit affirmative replies. Anything else -- no, cancel, "sure?", "ok",
+#: empty, "none" from a non-interactive session -- is unconfirmed.
 AFFIRMATIVE = frozenset({
     "yes", "y", "yeah", "yep", "yes please", "send it", "do it",
     "confirm", "confirmed", "go ahead", "send",
 })
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def parse_confirmation(reply) -> bool:
@@ -28,73 +36,82 @@ def parse_confirmation(reply) -> bool:
             or text.startswith("yes,"))
 
 
-def send_email(to_address: str, subject: str, content: str) -> bool:
-    """Send an email using SMTP over TLS with credentials loaded from environment.
+def _safe(message: str) -> str:
+    """Error text safe to log and to return.
 
-    Safety gate: explicit user confirmation is required BEFORE the irreversible
-    SMTP dispatch, on every path that reaches this function (tool registry,
-    LLM tool loop, interactive handler). Unconfirmed means unsent.
-    Recipient and subject may be logged; the body never is.
+    Key-shaped strings are redacted by prefix, but an SMTP error can echo this
+    account's own app password verbatim, and that string looks like ordinary
+    words. Removing the literal credential is the only thing that catches it.
+    """
+    text = redact(message)
+    secret = str(GMAIL_APP_PASSWORD or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def resolve_contact(query: str):
+    """Email address for a contact alias mentioned in `query`, or None."""
+    lowered = (query or "").lower()
+    for name, address in (CONTACTS or {}).items():
+        if name.lower() in lowered:
+            return address
+    return None
+
+
+def send_email(to_address: str, subject: str, content: str,
+               confirmed: bool = False) -> str:
+    """Send an email, if the caller already has the user's confirmation.
+
+    The confirmation gate is on ``confirmed``, not on a prompt read here: a
+    tool cannot ask the user a question the conversation has not already
+    answered. The Brain sets ``confirmed`` only after the user has said yes in
+    their own turn, which is also the only place the answer is available.
+
+    Args:
+        to_address: Recipient.
+        subject: Subject line.
+        content: Message body.
+        confirmed: True only when the user explicitly approved this send.
+
+    Returns:
+        A short status string. Never raises.
     """
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        speak("Gmail credentials are not configured in your .env file.")
-        logger.warning("Missing GMAIL_ADDRESS or GMAIL_APP_PASSWORD in .env.")
-        return False
+        logger.warning("send_email called without GMAIL_ADDRESS/GMAIL_APP_PASSWORD set.")
+        return "Email is not configured: GMAIL_ADDRESS and GMAIL_APP_PASSWORD are missing from .env."
 
-    logger.info(f"Email send requested: recipient={to_address} subject={subject!r}")
-    speak(f"Send this email to {to_address}? (yes/no)")
-    if not parse_confirmation(listen("Answer (yes/no): ")):
-        logger.info(f"Email send unconfirmed: recipient={to_address} subject={subject!r}")
-        speak("Email not sent.")
-        return False
+    recipient = (to_address or "").strip()
+    if not _EMAIL_RE.match(recipient):
+        logger.warning(f"Refusing to send to a malformed address: {to_address!r}")
+        return f"'{to_address}' is not a valid email address, so nothing was sent."
 
+    if not confirmed:
+        logger.info(f"Email to {recipient} NOT sent: no explicit confirmation.")
+        return ("This email was not sent. Ask the user to confirm first, then "
+                "call send_email again with confirmed=true.")
+
+    logger.info(f"Sending email: recipient={recipient} subject={subject!r}")
     try:
         msg = MIMEMultipart()
         msg["From"] = GMAIL_ADDRESS
-        msg["To"] = to_address
-        msg["Subject"] = subject
-        msg.attach(MIMEText(content, "plain"))
+        msg["To"] = recipient
+        msg["Subject"] = subject or ""
+        msg.attach(MIMEText(content or "", "plain"))
 
         server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
-        server.ehlo()
-        server.starttls()
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        try:
+            server.ehlo()
+            server.starttls()
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        finally:
+            server.quit()
 
-        logger.info(f"Email sent: recipient={to_address} subject={subject!r}")
-        speak(f"Email successfully sent to {to_address}!")
-        return True
-    except Exception as e:
-        logger.error(f"Email error for {to_address}: {e}", exc_info=True)
-        speak("Sorry, I was unable to send the email.")
-        return False
-
-
-def handle_email_command(query: str) -> None:
-    """Interactive command handler for email sending."""
-    target_address = None
-
-    # Check known contact aliases from config.yaml
-    for contact_name, email in CONTACTS.items():
-        if contact_name.lower() in query.lower():
-            target_address = email
-            speak(f"Found contact {contact_name}.")
-            break
-
-    if not target_address:
-        speak("Whom should I send the email to? Please speak the email address.")
-        spoken_address = listen()
-        if spoken_address == "none":
-            speak("Email canceled.")
-            return
-        target_address = spoken_address.replace(" at the rate ", "@").replace(" at ", "@").replace(" ", "").lower()
-
-    speak("What is the message content?")
-    content = listen()
-    if content == "none":
-        speak("Email canceled.")
-        return
-
-    subject = "Message from JARVIS Assistant"
-    send_email(target_address, subject, content)
+        logger.info(f"Email sent: recipient={recipient} subject={subject!r}")
+        return f"Email sent to {recipient}."
+    except Exception as e:  # noqa: BLE001
+        detail = _safe(str(e))
+        # No exc_info: the traceback would carry the unredacted exception text.
+        logger.error(f"Email send failed for {recipient}: {detail}")
+        return f"I could not send the email to {recipient}: {detail}"

@@ -30,7 +30,7 @@ class LocalIntentResult:
 _INTENT_TOOLS = {
     "time": "tell_time",
     "dictionary": "lookup_dictionary",
-    "weather": "get_temperature",
+    "weather": "get_weather",
     "screenshot": "take_screenshot",
     "launch_app": "launch_app",
     "media_play": "play_music",

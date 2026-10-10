@@ -2,7 +2,6 @@
 
 import urllib.parse
 import webbrowser
-from jarvis.speech import speak
 from jarvis.config import DEFAULT_MAPS_QUERY
 
 # Predefined quick URLs
@@ -17,19 +16,17 @@ KNOWN_SERVICES = {
 
 
 def open_service(service_name: str) -> str:
-    """Open a predefined common web service."""
-    service_clean = service_name.lower().strip()
-    for name, url in KNOWN_SERVICES.items():
-        if name in service_clean:
-            webbrowser.open(url)
-            speak(f"Opening {name} now.")
-            return f"Opened {url}"
-
-    # Generic domain fallback
-    cleaned = service_clean.replace("open", "").replace("website", "").replace(" ", "").strip()
-    url = f"https://www.{cleaned}.com"
+    """Open a known service; unknown names never become guessed domains."""
+    cleaned = " ".join((service_name or "").lower().split())
+    for prefix in ("open ", "launch ", "visit "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+    cleaned = cleaned.removesuffix(" website").strip()
+    url = KNOWN_SERVICES.get(cleaned)
+    if url is None:
+        return f"I don't have a trusted URL for '{service_name}'."
     webbrowser.open(url)
-    speak(f"Launching {cleaned} website.")
     return f"Opened {url}"
 
 
@@ -41,7 +38,6 @@ def search_youtube(query: str) -> str:
     encoded = urllib.parse.quote_plus(clean_query)
     url = f"https://www.youtube.com/results?search_query={encoded}"
     webbrowser.open(url)
-    speak(f"Here are the YouTube results for {clean_query}.")
     return f"Searched YouTube for {clean_query}"
 
 
@@ -53,7 +49,6 @@ def search_google(query: str) -> str:
     encoded = urllib.parse.quote_plus(clean_query)
     url = f"https://www.google.com/search?q={encoded}"
     webbrowser.open(url)
-    speak(f"Searching Google for {clean_query}.")
     return f"Searched Google for {clean_query}"
 
 
@@ -63,5 +58,4 @@ def open_maps(location: str = None) -> str:
     encoded = urllib.parse.quote_plus(loc)
     url = f"https://www.google.com/maps/search/{encoded}"
     webbrowser.open(url)
-    speak(f"Opening Google Maps for {loc}.")
     return f"Opened maps for {loc}"

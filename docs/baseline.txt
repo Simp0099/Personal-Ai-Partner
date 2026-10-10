@@ -1,0 +1,175 @@
+Ai Partner / Jarvis 2.0 — Phase 0 Baseline
+==========================================
+Date/time (UTC): 2026-10-08 ~20:45 UTC (Asia/Kolkata local ~2026-10-09 02:15)
+Branch: main
+Commit: 5c8aef7 (short)
+Python: 3.14.7 (repo targets 3.12 per README/requirements; suite passes anyway)
+Test command: python -m pytest tests/
+Test result: 793 passed, 1 skipped in ~11-17s (matches documented 793 baseline)
+  Skipped: tests/test_integration.py:363 native ONNX wake-word test
+    (opt-in via JARVIS_TEST_NATIVE_WAKEWORD=1; skipped to avoid teardown abort)
+  Warnings (benign): google.genai DeprecationWarning (_UnionGenericAlias);
+    speech_recognition aifc DeprecationWarning on 3.13+.
+  Pre-existing working-tree modifications (NOT made by Phase 0, left untouched):
+    M jarvis/main.py — wake-word loop uses shutdown_requested Event + join()
+    M jarvis/wake_word.py — dependency-failure guard, _running reset, join()
+    ?? chatterbox_test.wav (untracked artifact)
+
+ARCHITECTURE SUMMARY
+- Terminal-first assistant; no browser/server/second process.
+- Pipeline: wake word -> shared-mic audio/VAD -> STT -> router ->
+  Gemini/OpenRouter/Zen + bounded tool loop -> memory/vision/tools ->
+  Chatterbox TTS -> speaker.
+
+ENTRY POINT
+- `python -m jarvis` -> jarvis/__main__.py -> start.main() (start.py:200).
+- Flags: --text (text loop), --no-wake (voice w/o wake), --test, --status.
+- start.check_environment() (start.py:26) gates on .env + GEMINI_API_KEY.
+- Modes in jarvis/main.py: run_text_mode:221, run_assistant:121,
+  run_wake_word_mode:157. Shutdown: utterance match (SHUTDOWN_PHRASES:32-41),
+  KeyboardInterrupt, finally stop_voice/stop_perception + listener.stop().
+
+ROUTER
+- Entry: JarvisBrain.ask (brain.py:710) -> _ask_locked (brain.py:775).
+- Classify: ModelLayer.classify (model_layer.py:129) -> deterministic
+  keyword classify() (classify.py:124); no LLM.
+- Rank: ModelRouter.select (router.py:150); score = 0.30*capability +
+  0.25*task + 0.25*reliability + 0.10*latency + 0.10*priority, sort
+  (-score,-priority,key). Hard filters in _eligible (router.py:189-238):
+  unconfigured provider, context fit, tool_calling/vision caps, task
+  requirements; prefer_free drops paid if any free survives.
+- Health: HealthTracker (health.py:117); base backoff = cooldown_seconds 60s;
+  AUTH/INVALID_REQUEST/UNSUPPORTED = no cooldown + abort; else exp backoff
+  15s..900s; probe_cooling_models re-admits nearest-expiry.
+- Fallback: ranked[:max_attempts=4] tried in _ask_locked (brain.py:838-912).
+- API calls: Gemini GeminiChatSession.send_message (providers/gemini.py:158);
+  OpenRouter/Zen OpenAICompatProvider.post_chat via urllib
+  (providers/openai_compat.py:301-315). direct.py:56 is diagnostics-only.
+
+LLM TOOL-CALL DECISION POINTS (single serving loop; no others)
+- ONLY: JarvisBrain._run_tool_loop (brain.py:924), entered when
+  response.has_tool_calls (providers/base.py:396-398). ephemeral turns pass
+  tools=[] (brain.py:603) so perception never calls tools; direct.py:56 no tools.
+- Lookup: TOOL_REGISTRY dict from GEMINI_TOOLS list (brain.py:475-498).
+- Exec: _execute_tool_call (brain.py:689-704); unknown->error string,
+  TypeError->args string, Exception->logged error string; never raises.
+- Args: Gemini SDK auto-declaration from hints/docstrings; openai_compat
+  _function_to_schema via inspect.signature (openai_compat.py:368-415).
+- Results: grouped assistant/tool messages, fed back via send_message
+  kind=tool_results (brain.py:986-993).
+- Bounds: MAX_TOOL_ROUNDS=8 (config llm.max_tool_rounds); non-idempotent
+  dedup set (brain.py:507-515) + _tool_cache_key (brain.py:1030-1043).
+
+TOOL REGISTRY
+- No class/decorator/schema files. Registration = GEMINI_TOOLS list of 19
+  callables (brain.py:475-495); dispatch dict TOOL_REGISTRY (brain.py:498);
+  thin wrappers (brain.py:214-473) adapt jarvis/tools/* modules.
+- 19 tools: search_wikipedia, open_website, search_youtube, search_google,
+  open_maps, get_temperature, get_nasa_apod, take_screenshot, play_music,
+  lookup_dictionary, send_email, tell_time, tell_joke, get_system_time,
+  get_directory_contents, get_system_status, save_memory, recall_memories,
+  forget_memory.
+- Present: time (x2), dictionary (meaning only; synonym/antonym unregistered),
+  weather, screenshot, media (play_music), email.
+- Missing (do NOT duplicate-by-accident; these genuinely don't exist):
+  app launcher, volume/brightness/mute.
+
+CHATTERBOX TTS
+- File jarvis/speech.py (module-level fns + globals, no class).
+- Init: _get_chatterbox_model() (speech.py:108); from_pretrained(device)
+  (speech.py:142); cached in _chatterbox_model global -> ONCE per process.
+- Recreated per response?: NO (guard speech.py:122-124).
+- Reference audio: _resolve_chatterbox_reference() (speech.py:75); resolved
+  FRESH on every synthesis (not cached); default
+  chatterbox_emotion_test.wav (config speech.chatterbox_reference_audio).
+- Device: _chatterbox_device() (speech.py:93); auto->mps/cuda/cpu.
+- inference_mode/no_grad: NONE (zero hits in TTS path).
+- Generation knobs: only exaggeration/cfg_weight/temperature
+  (speech.py:173-180; defaults 0.5/0.5/0.8).
+- Warm-up: NONE.
+
+WAKE / VAD / STT
+- Wake: openWakeWord ONNX Model (wake_word.py:56-77); phrase "hey_jarvis"
+  (config.yaml:321); threshold 0.5 (config.yaml:322); detection in
+  VoiceLoop._on_frame (voice_loop.py:240-284) shared path, legacy
+  WakeWordListener._listen_loop (wake_word.py:156-228); echo cooldown 0.6s.
+- VAD: energy + adaptive noise floor, VoiceActivityDetector (audio.py:86-247);
+  thresholds energy 0.01 / min_speech 200ms / end_silence 700ms /
+  barge_in 300ms / snr 3.0 / barge_in_snr 4.0.
+- STT: SpeechRecognition + Google; legacy listen() (speech.py:349-390);
+  shared-stream Transcriber (speech_pipeline.py:238-286).
+- Mic: SINGLE shared MicrophoneStream (audio.py:609-717), one reader thread,
+  fan-out sinks; owned by VoiceLoop; never opened when wake disabled
+  (voice_loop.py:580-593). Legacy listener keeps own stream only in legacy mode.
+
+LOGGING
+- Infra: jarvis/logger.py _setup_logger; logger "jarvis"; console INFO +
+  RotatingFileHandler data/jarvis.log (1MB x3) DEBUG; StatusIndicator symbols.
+- User transcript: print() speech.py:329, main.py:257. Prompts/banners: print()
+  speech.py:361,377,379; main.py:193-197,223-234; start.py checks/status.
+- Routing/model debug: logger.info gated by DEBUG_INPUT (default OFF).
+- Provider errors: logger.error/warning with safe_detail redaction
+  (providers/base.py:159-213). No raw logging.* outside logger.py; no print()
+  in voice_loop/audio/wake_word runtime paths.
+
+SECURITY (.env / .gitignore)
+- .env IGNORED (.gitignore:2); .env.example tracked, .env NOT tracked
+  (only .env.example in git ls-files). data/*.db, *.log ignored.
+- config.yaml holds NO secrets (api_key_env names only).
+- Grep for key patterns (AIza/sk-or-v1/xox) in tracked py/yaml: no hits
+  outside redaction-prefix lists and test fixtures. CLEAN.
+- Env vars: GEMINI/OPENROUTER/OPENCODE_ZEN_API_KEY, NASA_API_KEY,
+  GMAIL_ADDRESS, GMAIL_APP_PASSWORD, PICOVOICE_ACCESS_KEY (names only).
+
+PROVIDERS / MODELS (config.yaml:27-275)
+- gemini (type gemini, enabled, ctx 1M): gemini_flash gemini-3.6-flash pri90
+  paid verified 2026-10-06; gemini_flash_lite gemini-3.5-flash-lite pri70 paid
+  verified. NOTE: "gemini-3.6-flash"/"gemini-3.5-flash-lite" are unusual ids;
+  config claims live-verified 2026-10-06 -> treat as CONFIG-ASSERTED, re-verify
+  live before trusting in later phases.
+- openrouter (enabled, base openrouter.ai/v1): 4 free models pri 85/80/75/70,
+  all marked verified (catalog; live calls unverified per own notes).
+- opencode_zen (enabled, base opencode.ai/zen/v1): space_bunny_free pri78
+  enabled, tool_calling=false; big_pickle DISABLED (403 FreeTierError outside
+  OpenCode client) -- must stay disabled until live call succeeds.
+- Routing: weights .30/.25/.25/.10/.10, cooldown 60s, max_attempts 4,
+  probe_cooling true, prefer_free true, latency_ref 4000ms.
+
+CLI / RUNTIME SMOKE
+- --status: OK, exit 0 (assistant/user/model/TTS/wake/vision/voice-off/
+  4 facts/ log size shown).
+- `--text "what time is it"`: NOT SUPPORTED as written -- argparse rejects the
+  positional arg (unrecognized arguments). --text is interactive (input loop).
+- Equivalent non-interactive probe JarvisBrain().ask("what time is it"):
+  routing OK (7/7 usable, Gemini-first ordering), fallback chain attempted 4
+  OpenRouter free models, ALL failed HTTP 429 free-models-per-day (50/day
+  exhausted); BrainError "usage limit reached". No provider answered; no local
+  tool reached (LLM never returned a tool call). External quota, not repo bug.
+- speak()/TTS and mic paths NOT exercised (no audio side effects in Phase 0).
+
+KNOWN ISSUES (ranked)
+1. [Medium] OpenRouter free daily quota exhausted (50/day) -- live smoke
+   blocked until reset or credits; Gemini paid path untested this run.
+2. [Medium] Uncommitted working-tree changes (main.py, wake_word.py) pre-date
+   Phase 0 -- later phases must rebase/diff against them, not overwrite.
+3. [Low] `python -m jarvis --text "<q>"` single-shot form from docs/prompt
+   does not exist; --text is interactive-only.
+4. [Low] Runtime Python 3.14.7 vs documented 3.12 (works; deprecation warnings
+   from google.genai + speech_recognition).
+5. [Low] big_pickle must remain disabled (known 403); model ids
+   gemini-3.6-flash / gemini-3.5-flash-lite rely on config's own
+   verified_on claim -- re-verify live.
+6. [Informational] TTS has no inference_mode/no_grad, no warm-up, reference
+   audio re-resolved per call -- measurement-only notes, no change per rules.
+
+CONSTRAINTS FOR LATER PHASES
+- Keep ModelRouter the single provider router; extend, don't duplicate.
+- Reuse TOOL_REGISTRY/GEMINI_TOOLS; don't duplicate existing tools.
+- Preserve shared-mic architecture (wake+VAD+STT one stream).
+- Keep Chatterbox; no quality reduction without measurement.
+- Don't silently change provider/model config; big_pickle stays disabled.
+- Incremental, test-backed; suite must stay green (793+1 baseline).
+
+RECOMMENDATION: READY FOR PHASE 1 (inspection/test/runtime baselines green;
+live-model verification gated only by external quota, not repo state).
+No application files modified by Phase 0; only docs/baseline.txt created.

@@ -18,7 +18,6 @@ Usage:
     python3 scripts/phase4_live_check.py
 """
 
-import subprocess
 import sys
 import tempfile
 import threading
@@ -73,25 +72,26 @@ def check_microphone():
     return True
 
 
-def check_wake_engine(mic_ok):
+def check_wake_engine(mic_ok, microphone=None):
     """Wake-word model loads and scores real microphone audio."""
     engine = WakeWordEngine()
     if not engine.load():
         skip("C — wake-word model", "openWakeWord model failed to load")
         return
     scores = []
-    stream = MicrophoneStream()
+    stream = microphone or MicrophoneStream()
+    stream.add_sink(lambda pcm: scores.append(engine.score(pcm)))
     if not stream.start():
+        engine.close()
         check("C — wake-word model scores real audio", False, "no microphone")
         return
     try:
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and len(scores) < 30:
-            pcm = stream.source.read()
-            if pcm:
-                scores.append(engine.score(pcm))
+            time.sleep(0.05)
     finally:
         stream.stop()
+        engine.close()
     peak = max(scores) if scores else 0.0
     check("C — wake-word model scores real audio", bool(scores),
           f"{len(scores)} chunks scored by '{engine.model}', peak {peak:.3f} "
@@ -150,7 +150,8 @@ def render_speech(text):
         try:
             # ASCII only: `say` chokes on emoji and other non-ASCII punctuation.
             safe = "".join(ch if ord(ch) < 128 else " " for ch in key)
-            subprocess.run(["say", "-o", str(out), safe], check=True, capture_output=True)
+            from jarvis.speech import _run_say
+            _run_say(["-o", str(out), safe], check=True, capture_output=True)
             _SPEECH_CACHE[key] = out
             return out
         except Exception as e:  # noqa: BLE001
@@ -201,20 +202,6 @@ def _tts(text):
     return system_speech(text)[0]
 
 
-def _play(data, rate):
-    import sounddevice as sd
-    sd.play(np.frombuffer(data, dtype=np.float32), rate)
-    sd.wait()
-
-
-def _stop():
-    try:
-        import sounddevice as sd
-        sd.stop()
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def check_echo():
     """Test E — the assistant must not hear itself.
 
@@ -231,7 +218,7 @@ def check_echo():
         skip("E — echo (assistant does not trigger itself)", f"no speech audio available: {e}")
         return
 
-    player = SpeechPlayer(synthesize=_tts, play=_play, stop_playback=_stop, chunk_ms=220)
+    player = SpeechPlayer(synthesize=_tts, chunk_ms=220)
     loop = VoiceLoop(
         machine=machine,
         microphone=MicrophoneStream(),
@@ -562,7 +549,7 @@ def _measure_marks():
     from jarvis.brain import JarvisBrain
 
     machine = ConversationMachine()
-    player = SpeechPlayer(synthesize=_tts, play=_play, stop_playback=_stop, chunk_ms=220)
+    player = SpeechPlayer(synthesize=_tts, chunk_ms=220)
 
     class Fixed:
         def transcribe(self, pcm, sample_rate=16000):

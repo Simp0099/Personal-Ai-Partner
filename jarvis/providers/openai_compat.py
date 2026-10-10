@@ -178,6 +178,8 @@ class OpenAICompatSession(ChatSession):
             body["tools"] = tools_payload
             body["tool_choice"] = "auto"
 
+        # Per request, from the turn budget the Brain passed when opening the
+        # session -- so a tool loop cannot outlive the user.
         response = self._provider.post_chat(
             body, model_id=self._model_id, timeout=self._options.get("timeout", DEFAULT_TIMEOUT)
         )

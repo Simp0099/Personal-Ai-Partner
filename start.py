@@ -24,8 +24,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def check_environment():
-    """Verify all required environment variables and dependencies are present."""
-    from jarvis.config import GEMINI_API_KEY, LLM_MODEL, ASSISTANT_NAME
+    """Verify that at least one enabled model has its provider credential."""
+    from jarvis.config import LLM_MODEL, ASSISTANT_NAME
     from jarvis.logger import logger
 
     print(f"\n{'='*60}")
@@ -40,17 +40,25 @@ def check_environment():
     else:
         print(f"  OK")
 
-    # Check .env file
+    # A .env file is convenient, not required when credentials are exported by
+    # the shell or another secrets manager.
     env_file = PROJECT_ROOT / ".env"
-    print(f"\n[Check] .env file: {'Found' if env_file.exists() else 'NOT FOUND'}")
-    if not env_file.exists():
-        print(f"  ERROR: Copy .env.example to .env and fill in your keys")
+    print(f"\n[Check] .env file: {'Found' if env_file.exists() else 'not present (environment variables are also supported)'}")
+    try:
+        from jarvis.model_layer import ModelLayer
+        layer = ModelLayer.from_config()
+        usable = [
+            model.key for model in layer.registry.enabled()
+            if (provider := layer.providers.get(model.provider))
+            and provider.is_configured()
+        ]
+    except Exception as e:
+        print(f"  ERROR: Could not validate configured providers: {e}")
         return False
-
-    # Check GEMINI_API_KEY
-    print(f"\n[Check] GEMINI_API_KEY: {'Configured' if GEMINI_API_KEY else 'MISSING'}")
-    if not GEMINI_API_KEY:
-        print(f"  ERROR: Add GEMINI_API_KEY to .env file")
+    print(f"[Check] Configured models: {len(usable)} usable")
+    if not usable:
+        print("  ERROR: No enabled model has usable provider credentials. "
+              "Configure a key for an enabled provider in .env or the environment.")
         return False
 
     # Check config.yaml
@@ -232,21 +240,15 @@ def main():
         print("\nStartup aborted. Please fix the issues above.\n")
         sys.exit(1)
 
-    # Start the appropriate mode
+    # Start the appropriate mode. --no-wake is a deprecated alias that now
+    # falls through to voice mode, so existing commands keep working.
     if args.text:
         from jarvis.main import run_text_mode
         run_text_mode()
-    elif args.no_wake:
-        from jarvis.main import run_assistant
-        try:
-            run_assistant()
-        except KeyboardInterrupt:
-            print("\nSession ended by user.")
-            sys.exit(0)
     else:
-        from jarvis.main import run_wake_word_mode
+        from jarvis.main import run_voice_mode
         try:
-            run_wake_word_mode()
+            run_voice_mode()
         except KeyboardInterrupt:
             print("\nSession ended by user.")
             sys.exit(0)

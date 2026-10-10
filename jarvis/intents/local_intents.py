@@ -27,10 +27,14 @@ def handle_dictionary(dispatch: Callable[[str, dict], str], word: str) -> str:
 
 
 def handle_weather(dispatch: Callable[[str, dict], str], city: str) -> str:
-    target = city or "Delhi"  # same default the weather tool uses
+    from jarvis.config import DEFAULT_CITY
+
+    target = city or DEFAULT_CITY
     result = (dispatch("get_temperature", {"city": target}) or "").strip()
     if result:
-        return f"The temperature in {target} is {result}."
+        # The weather tool already returns a full sentence, including the
+        # conditions and the day's range.
+        return result
     return f"I couldn't get the weather for {target} right now."
 
 

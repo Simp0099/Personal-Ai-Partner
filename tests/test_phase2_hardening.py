@@ -125,10 +125,10 @@ class TestParaphraseRetrieval:
 
 
 # ============================================================================
-# 2. Stale memory reconciliation
+# 2. Legacy memory preservation
 # ============================================================================
 
-class TestStaleMemoryReconciliation:
+class TestLegacyMemoryPreservation:
     def _legacy(self, conn, fact, category="fact"):
         conn.execute(
             "INSERT INTO memories (fact, category, active) VALUES (?, ?, 1)",
@@ -137,30 +137,29 @@ class TestStaleMemoryReconciliation:
         conn.commit()
 
     def _reopen(self, conn):
-        """Re-run migration/reconciliation, as a restart would."""
-        memory.init_memory_db(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
+        """Re-run schema migration, as a restart would."""
+        reopened = memory.init_memory_db(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
+        reopened.close()
 
-    def test_stale_name_is_retired(self, db):
+    def test_different_legacy_claims_survive_restart(self, db):
         self._legacy(db, "User's name is Ravi.")
         self._legacy(db, "User's name is Alex")
         self._reopen(db)
-        assert "User's name is Ravi." not in memory.recall_all(db)
-        assert "User's name is Alex" in memory.recall_all(db)
+        assert set(memory.recall_all(db)) == {"User's name is Ravi.", "User's name is Alex"}
 
-    def test_newest_claim_wins(self, db):
+    def test_legacy_claims_with_similar_wording_survive_restart(self, db):
         self._legacy(db, "favourite language is Go")
         self._legacy(db, "favourite language is Rust")
         self._reopen(db)
-        assert _hits(db, "what language do I like") == ["favourite language is Rust"]
+        assert set(memory.recall_all(db)) == {"favourite language is Go", "favourite language is Rust"}
 
-    def test_reconciliation_is_generic_not_name_specific(self, db):
-        """No hardcoded person or fact: any 'X is Y' then 'X is Z' resolves."""
+    def test_fact_skeletons_do_not_infer_supersession(self, db):
         self._legacy(db, "The deploy target is staging")
         self._legacy(db, "The deploy target is production")
         self._reopen(db)
         active = memory.recall_all(db)
         assert "The deploy target is production" in active
-        assert "The deploy target is staging" not in active
+        assert "The deploy target is staging" in active
 
     def test_unrelated_facts_are_untouched(self, db):
         self._legacy(db, "User's name is Alex")
@@ -177,27 +176,26 @@ class TestStaleMemoryReconciliation:
         self._reopen(db)
         assert len(memory.recall_all(db)) == 2
 
-    def test_reconciliation_is_idempotent(self, db):
+    def test_repeated_restart_preserves_legacy_facts(self, db):
         self._legacy(db, "User's name is Ravi.")
         self._legacy(db, "User's name is Alex")
         self._reopen(db)
-        first = memory.recall_all(db)
+        first = set(memory.recall_all(db))
         self._reopen(db)
-        assert memory.recall_all(db) == first
+        assert set(memory.recall_all(db)) == first == {"User's name is Ravi.", "User's name is Alex"}
 
-    def test_skeleton_needs_a_value_shape(self, db):
-        """A long sentence tail is not a 'value', so nothing is merged."""
+    def test_overlapping_words_do_not_merge_distinct_facts(self, db):
         self._legacy(db, "The meeting is on friday to discuss the roadmap")
         self._legacy(db, "The standup is on monday to discuss the roadmap")
         self._reopen(db)
         assert len(memory.recall_all(db)) == 2
 
-    def test_explicit_writes_still_win_after_reconcile(self, db):
-        self._legacy(db, "User's name is Ravi.")
+    def test_explicit_subject_supersession_remains_write_time_only(self, db):
+        memory.remember(db, "User's name is Ravi.", "fact", subject="user:name")
         memory.remember(db, "User's name is Alex", "fact", subject="user:name",
                         source="explicit")
         self._reopen(db)
-        assert "User's name is Ravi." not in memory.recall_all(db)
+        assert memory.recall_all(db) == ["User's name is Alex"]
 
 
 # ============================================================================

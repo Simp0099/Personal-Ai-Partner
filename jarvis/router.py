@@ -66,11 +66,15 @@ class RoutingConfig:
     weights: RoutingWeights = field(default_factory=RoutingWeights)
     cooldown_seconds: float = 60.0
     max_attempts: int = 4
+    #: Consecutive 429s after which a model is treated as quota-exhausted.
+    daily_request_cap: Optional[int] = None
     #: When every candidate is in cooldown, allow the least-bad one anyway
     #: rather than failing outright. A stale cooldown should not deadlock.
     probe_cooling_models: bool = True
-    prefer_free: bool = True
     latency_reference_ms: float = 4000.0
+
+
+TIER_RANK = {"primary": 0, "fallback": 1, "emergency": 2}
 
 
 @dataclass
@@ -166,9 +170,9 @@ class ModelRouter:
         scored = [self._score(spec, classification, context_tokens) for spec in candidates]
         scored = [s for s in scored if s.key not in exclude_set]
 
-        # Best first. Tie-break on configured priority then key so the ordering
-        # is fully deterministic.
-        scored.sort(key=lambda s: (-s.score, -s.spec.priority, s.spec.key))
+        # Best first. Tier first, then score, priority, key — deterministic.
+        scored.sort(key=lambda s: (TIER_RANK.get(s.spec.tier, 1), -s.score,
+                                   -s.spec.priority, s.spec.key))
         return scored
 
     def best(
@@ -221,21 +225,22 @@ class ModelRouter:
         if not pool:
             return []
 
-        # `prefer_free` (config: routing.prefer_free) is a cost guard, not a
-        # tie-breaker: when any free model can serve this request, paid models
-        # are dropped from the chain outright. Scoring alone is not enough --
-        # a higher-priority paid model can outrank a free one and then be
-        # reached later in the fallback chain once the free models fail.
-        if self.config.prefer_free and any(s.free for s in pool):
-            pool = [s for s in pool if s.free]
-
         available = [s for s in pool if self.health.available(s.key)]
         if available or not self.config.probe_cooling_models:
             return available
 
         # Everything is cooling down. Re-admit the model whose cooldown expires
-        # soonest so the system can recover instead of deadlocking.
+        # soonest so the system can recover instead of deadlocking -- but never a
+        # quota-exhausted one: probing it just burns the rest of a daily budget
+        # that cannot recover before the reset anyway.
+        usable = [s for s in pool if not self._quota_exhausted(s.key)]
+        pool = usable or pool
         return [min(pool, key=lambda s: (self.health.stats(s.key).cooldown_remaining(), s.key))]
+
+    def _quota_exhausted(self, key: str) -> bool:
+        """Whether a model is parked until its provider's daily reset."""
+        stat = self.health.peek(key)
+        return bool(stat and stat.quota_exhausted_at is not None)
 
     def _meets_task_requirements(self, spec: ModelSpec, classification: Classification) -> bool:
         """Check required capabilities for the classified task."""

@@ -1,0 +1,30 @@
+.................s...................................................... [  7%]
+........................................................................ [ 14%]
+........................................................................ [ 21%]
+........................................................................ [ 28%]
+........................................................................ [ 35%]
+........................................................................ [ 42%]
+........................................................................ [ 49%]
+........................................................................ [ 56%]
+........................................................................ [ 63%]
+........................................................................ [ 70%]
+........................................................................ [ 77%]
+........................................................................ [ 84%]
+........s............................................................... [ 91%]
+........................................................................ [ 98%]
+..................                                                       [100%]
+=============================== warnings summary ===============================
+tests/test_phase4_voice.py::TestTextCoexistence::test_unintelligible_speech_yields_no_transcript
+  /Users/bhavishya/Documents/Bhavishya/Code/Projects/Personal Projects/Ai Partner/Model/.venv/lib/python3.12/site-packages/speech_recognition/__init__.py:7: DeprecationWarning: 'aifc' is deprecated and slated for removal in Python 3.13
+    import aifc
+
+tests/test_phase4_voice.py::TestTextCoexistence::test_unintelligible_speech_yields_no_transcript
+  /Users/bhavishya/Documents/Bhavishya/Code/Projects/Personal Projects/Ai Partner/Model/.venv/lib/python3.12/site-packages/speech_recognition/__init__.py:8: DeprecationWarning: 'audioop' is deprecated and slated for removal in Python 3.13
+    import audioop
+
+tests/test_startup.py::test_startup_accepts_configured_non_gemini_provider
+  /Users/bhavishya/Documents/Bhavishya/Code/Projects/Personal Projects/Ai Partner/Model/.venv/lib/python3.12/site-packages/perth/perth_net/__init__.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+    from pkg_resources import resource_filename
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1024 passed, 2 skipped, 3 warnings in 14.86s

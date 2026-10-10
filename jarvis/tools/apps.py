@@ -11,7 +11,6 @@ import subprocess
 
 from jarvis.config import ALLOWED_APPS
 from jarvis.logger import logger
-from jarvis.speech import speak
 
 
 def normalize_app_name(name) -> str:
@@ -33,7 +32,10 @@ def resolve_allowed(name: str):
 
 
 def launch_app(app_name: str) -> str:
-    """Launch an allowlisted macOS application. Never raises to the caller."""
+    """Launch an allowlisted macOS application. Never raises to the caller.
+
+    Returns text and stays silent: the conversation layer speaks the reply.
+    """
     requested = normalize_app_name(app_name)
     if not requested:
         return "I need an application name to open. For example: Open Safari."
@@ -66,5 +68,4 @@ def launch_app(app_name: str) -> str:
         return f"{resolved} isn't installed on this Mac, so I couldn't open it."
 
     logger.info(f"App launch succeeded: {resolved!r}")
-    speak(f"Opening {resolved}.")
     return f"{resolved} is now open."

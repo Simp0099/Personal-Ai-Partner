@@ -22,6 +22,11 @@ from jarvis.providers.base import ErrorKind
 MIN_BACKOFF_SECONDS = 15.0
 MAX_BACKOFF_SECONDS = 900.0
 
+#: Cooldown applied once a model's daily request cap is hit. Reaching the cap
+#: is categorically different from one transient 429: the key resets at the
+#: provider's daily boundary, so a 60s backoff just burns more of the quota.
+DAILY_QUOTA_COOLDOWN_SECONDS = 24 * 3600.0
+
 
 @dataclass
 class HealthStats:
@@ -45,6 +50,12 @@ class HealthStats:
     last_error_kind: Optional[str] = None
     cooldown_until: Optional[float] = None
     consecutive_failures: int = 0
+    #: Set when `daily_request_cap` was reached. Distinguishes "this key is done
+    #: until the provider's daily reset" from a transient rate limit.
+    quota_exhausted_at: Optional[float] = None
+    daily_request_cap: Optional[int] = None
+    requests_this_window: int = 0
+    window_started_at: float = field(default_factory=time.time)
 
     # -- derived ----------------------------------------------------------
 
@@ -117,11 +128,25 @@ class HealthStats:
 class HealthTracker:
     """Thread-safe store of :class:`HealthStats` keyed by model id."""
 
-    def __init__(self, base_backoff: float = 60.0, max_backoff: float = MAX_BACKOFF_SECONDS):
+    def __init__(
+        self,
+        base_backoff: float = 60.0,
+        max_backoff: float = MAX_BACKOFF_SECONDS,
+        daily_request_cap: Optional[int] = None,
+    ):
         self._stats: Dict[str, HealthStats] = {}
         self._lock = threading.RLock()
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
+        #: Per-model request budget before the key is parked until the daily
+        #: reset. None disables the cap entirely.
+        self.daily_request_cap = daily_request_cap
+
+    def set_daily_request_cap(self, cap: Optional[int]) -> None:
+        self.daily_request_cap = cap
+        with self._lock:
+            for stat in self._stats.values():
+                stat.daily_request_cap = cap
 
     def stats(self, model_id: str) -> HealthStats:
         """Get (or create) stats for a model."""
@@ -150,6 +175,7 @@ class HealthTracker:
                 stat.recent_latencies = stat.recent_latencies[-20:]
             stat.last_success = time.time()
             stat.cooldown_until = None
+            stat.quota_exhausted_at = None
 
     def record_failure(
         self,
@@ -186,11 +212,37 @@ class HealthTracker:
             if kind in (ErrorKind.AUTH, ErrorKind.INVALID_REQUEST, ErrorKind.UNSUPPORTED):
                 return
 
+            # A rate limit that repeats past the configured budget is a spent
+            # daily quota, not a throttle: park the model until the reset rather
+            # than retrying it for the next few hours.
+            if kind is ErrorKind.RATE_LIMIT and self._quota_spent(stat, now_ts):
+                stat.quota_exhausted_at = now_ts
+                stat.cooldown_until = now_ts + DAILY_QUOTA_COOLDOWN_SECONDS
+                return
+
             backoff = min(
                 self.max_backoff,
                 self.base_backoff * (2 ** (stat.consecutive_failures - 1)),
             )
             stat.cooldown_until = now_ts + backoff
+
+    def _quota_spent(self, stat: HealthStats, now_ts: float) -> bool:
+        """Whether this rate limit was the configured request budget running out.
+
+        The count is consecutive 429s only. Successes reset it, so one unlucky
+        burst on an otherwise healthy model never parks the model for a day.
+        """
+        if not self.daily_request_cap:
+            return False
+        stat.daily_request_cap = self.daily_request_cap
+        return stat.rate_limit_count >= self.daily_request_cap
+
+    def seconds_until_quota_reset(self, model_id: str) -> float:
+        """Seconds until a quota-exhausted model is worth retrying (0 if not)."""
+        stat = self.peek(model_id)
+        if stat is None or stat.quota_exhausted_at is None:
+            return 0.0
+        return stat.cooldown_remaining()
 
     def available(self, model_id: str, now_ts: Optional[float] = None) -> bool:
         with self._lock:

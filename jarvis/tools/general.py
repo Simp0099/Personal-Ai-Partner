@@ -1,83 +1,70 @@
 """General utility tools for JARVIS 2.0 (Jokes, Time, Wikipedia, wikiHow).
 
-Phase 8: All errors caught and logged gracefully.
+Every tool here returns text and stays silent. Speaking belongs to whoever
+owns the turn -- the conversation layer, which then says the answer once
+instead of once per tool plus once in the reply.
 """
 
 import datetime
-from jarvis.speech import speak, listen
 from jarvis.logger import logger
 
 
 def tell_time() -> str:
-    """Announce the current system time."""
+    """Return the current system time for the conversation layer to present."""
     current_time = datetime.datetime.now().strftime("%I:%M %p")
-    speak(f"The current time is {current_time}.")
     return current_time
 
 
 def tell_joke() -> str:
-    """Fetch and speak a random programming/general joke."""
+    """Fetch a random programming/general joke.
+
+    Returns the joke as text. The conversation layer speaks the reply, so the
+    tool does not speak it: speaking here would say it twice.
+    """
     try:
         import pyjokes
-        joke = pyjokes.get_joke()
-        speak(joke)
-        return joke
+        return pyjokes.get_joke()
     except Exception as e:
-        logger.error(f"Joke error: {e}", exc_info=True)
-        speak("Why do programmers prefer dark mode? Because light attracts bugs.")
-        return "Fallback joke"
+        logger.warning(f"Joke fetch failed, using a local one: {e}")
+        return "Why do programmers prefer dark mode? Because light attracts bugs."
 
 
 def search_wikipedia(query: str) -> str:
     """Fetch a concise 2-sentence summary from Wikipedia."""
-    clean_query = query.replace("wikipedia", "").replace("search", "").replace("who is", "").replace("what is", "").strip()
+    clean_query = _clean(query, ("wikipedia", "search", "look up", "who is", "what is"))
     if not clean_query:
-        speak("What would you like me to look up on Wikipedia?")
-        clean_query = listen()
-        if clean_query == "none":
-            return ""
+        return "I need a topic to look up on Wikipedia."
 
     try:
         import wikipedia
-        speak("Searching Wikipedia...")
         summary = wikipedia.summary(clean_query, sentences=2)
-        logger.info(f"Wikipedia summary for '{clean_query}': {summary[:100]}")
-        speak(f"According to Wikipedia: {summary}")
+        logger.info(f"Wikipedia summary for {clean_query!r}: {summary[:100]}")
         return summary
     except Exception as e:
-        logger.error(f"Wikipedia error: {e}", exc_info=True)
-        speak(f"Sorry, I could not find a Wikipedia summary for {clean_query}.")
-        return ""
+        logger.warning(f"Wikipedia lookup failed for {clean_query!r}: {e}")
+        return f"I could not find a Wikipedia summary for {clean_query}."
 
 
 def search_wikihow(query: str) -> str:
     """Search wikiHow for instructional steps."""
-    clean_query = query.replace("how to", "").replace("jarvis", "").replace("friday", "").strip()
+    clean_query = _clean(query, ("how to", "how do i", "jarvis"))
     if not clean_query:
-        speak("What do you want to learn how to do?")
-        clean_query = listen()
-        if clean_query == "none":
-            return ""
+        return "I need to know what you want to learn."
 
     try:
         from pywikihow import search_wikihow as wikihow_search
-        speak(f"Searching instructions for {clean_query}...")
         results = wikihow_search(clean_query, max_results=1)
         if results:
-            summary = results[0].summary
-            speak(summary)
-            return summary
-        speak("I could not find instructions on wikiHow for that.")
-        return ""
+            return results[0].summary
+        return f"I could not find wikiHow instructions for {clean_query}."
     except Exception as e:
-        logger.error(f"wikiHow error: {e}", exc_info=True)
-        speak("Could not retrieve wikiHow instructions at this time.")
-        return ""
+        logger.warning(f"wikiHow lookup failed for {clean_query!r}: {e}")
+        return "I could not retrieve wikiHow instructions right now."
 
 
-def repeat_words() -> None:
-    """Echo back user speech."""
-    speak("I am listening. Speak now.")
-    content = listen()
-    if content != "none":
-        speak(f"You said: {content}")
+def _clean(query: str, noise: tuple) -> str:
+    """Strip filler words from a query. No voice prompt: the caller asks."""
+    text = (query or "").strip()
+    for word in noise:
+        text = text.replace(word, " ")
+    return " ".join(text.split())

@@ -34,7 +34,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from jarvis.config import DATA_DIR
 from jarvis.logger import logger
@@ -121,78 +121,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE memories SET subject = ? WHERE id = ?",
             (normalize(row["fact"]), row["id"]),
         )
-
-    _reconcile_stale(conn)
-
-
-def _reconcile_stale(conn: sqlite3.Connection) -> None:
-    """Retire legacy rows that a newer memory has already superseded.
-
-    Supersession is keyed on `subject`, so it only works once both rows agree on
-    one. A row written before keys existed carries its own text as its key and
-    would otherwise sit beside the current fact forever -- "the user's name is
-    Ravi" staying active after "the user's name is Alex" was stored.
-
-    The generic rule: when several active facts are about the same *thing*,
-    keep the most recently written. What identifies "the same thing" is the
-    subject key when it is a known shared key, and otherwise the fact's
-    predicate skeleton -- the leading "the user prefers X" / "name is X" shape
-    with the differing value removed. Nothing here is specific to any user.
-    """
-    rows = conn.execute(
-        "SELECT id, fact, subject, created_at FROM memories "
-        "WHERE active = 1 ORDER BY COALESCE(updated_at, created_at) DESC, id DESC"
-    ).fetchall()
-
-    known_subjects = {
-        r["subject"] for r in rows if r["subject"] and r["subject"] != normalize(r["fact"])
-    }
-
-    kept: Dict[str, int] = {}
-    for row in rows:
-        skeleton = _fact_skeleton(row["fact"])
-        if skeleton:
-            group_key = f"skeleton:{skeleton}"
-        elif row["subject"] in known_subjects:
-            group_key = f"subject:{row['subject']}"
-        else:
-            continue
-
-        if group_key in kept:
-            conn.execute(
-                "UPDATE memories SET active = 0 WHERE id = ?", (row["id"],)
-            )
-            logger.info(
-                f"Memory reconciled: retired #{row['id']} "
-                f"('{row['fact']}') as superseded by #{kept[group_key]}"
-            )
-        else:
-            kept[group_key] = row["id"]
-
-    conn.commit()
-
-
-def _fact_skeleton(fact: str) -> str:
-    """The shape of a fact with its most specific value dropped.
-
-    "the user's name is Alex" and "the user's name is Ravi" both reduce to
-    "the user name is", which is what makes them recognisable as the same
-    subject. Returns "" when nothing distinctive is left to compare.
-    """
-    text = normalize(fact)
-    if not text:
-        return ""
-    # The final token of "X is <value>" / "X prefers <value>" is the value; the
-    # rest is the claim. Only treat it as a skeleton when the tail looks like a
-    # bare value rather than a sentence.
-    match = re.match(r"^(.*?)\s+(?:is|are|was|were|prefers?|likes?|uses?|has)\s+(.+)$", text)
-    if not match:
-        return ""
-    claim, value = match.group(1), match.group(2)
-    if len(value.split()) > 4 or not claim:
-        return ""
-    return claim
-
 
 #: Words carrying no retrieval signal. Deliberately small: an aggressive stop
 #: list hides real matches in short messages like "what about Python?".
@@ -589,12 +517,25 @@ def forget(conn: sqlite3.Connection, fact_id: int) -> bool:
         return False
 
 
-def forget_matching(conn: sqlite3.Connection, query: str, *, limit: int = 5) -> List[str]:
-    """Deactivate active memories matching `query`, newest first.
+def find_matching(conn: sqlite3.Connection, query: str, *, limit: int = 5) -> List[str]:
+    """Return candidate facts without changing memory state."""
+    needle = (query or "").strip()
+    if len(re.sub(r"\W", "", needle)) < 3:
+        return []
+    with db_locked():
+        rows = conn.execute(
+            "SELECT fact FROM memories WHERE active = 1 "
+            "ORDER BY COALESCE(updated_at, created_at) DESC, id DESC"
+        ).fetchall()
+    folded = needle.casefold()
+    return [row["fact"] for row in rows if folded in row["fact"].casefold()][:limit]
 
-    Used for explicit "forget that" requests, where the user names the fact in
-    prose rather than by id. Matching is case-insensitive substring on the fact
-    text; a hit on a single word ("forget Python") is enough.
+
+def forget_matching(conn: sqlite3.Connection, query: str, *, limit: int = 5) -> List[str]:
+    """Deactivate one unambiguous active memory matching `query`.
+
+    Ambiguous queries are left untouched so the caller can show candidates and
+    ask the user to narrow the request.
 
     Args:
         conn: Active database connection.
@@ -606,25 +547,29 @@ def forget_matching(conn: sqlite3.Connection, query: str, *, limit: int = 5) -> 
         caller must report honestly rather than claiming success.
     """
     needle = (query or "").strip()
-    if not needle:
+    if len(re.sub(r"\W", "", needle)) < 3:
         return []
 
     try:
-        rows = conn.execute(
-            "SELECT id, fact FROM memories WHERE active = 1 AND LOWER(fact) LIKE ? "
-            "ORDER BY COALESCE(updated_at, created_at) DESC, id DESC LIMIT ?",
-            (f"%{needle.lower()}%", limit),
-        ).fetchall()
-        if not rows:
-            return []
-        now = datetime.now().isoformat(sep=" ", timespec="seconds")
-        for row in rows:
-            conn.execute(
-                "UPDATE memories SET active = 0, updated_at = ? WHERE id = ?",
-                (now, row["id"]),
+        with db_locked():
+            rows = conn.execute(
+                "SELECT id, fact FROM memories WHERE active = 1 "
+                "ORDER BY COALESCE(updated_at, created_at) DESC, id DESC"
+            ).fetchall()
+            matches = [row for row in rows if needle.casefold() in row["fact"].casefold()]
+            if len(matches) != 1:
+                return []
+            row = matches[0]
+            now = datetime.now().isoformat(sep=" ", timespec="seconds")
+            cursor = conn.execute(
+                "UPDATE memories SET active = 0, updated_at = ? "
+                "WHERE id = ? AND fact = ? AND active = 1",
+                (now, row["id"], row["fact"]),
             )
-        conn.commit()
-        return [row["fact"] for row in rows]
+            conn.commit()
+        if cursor.rowcount != 1:
+            return []
+        return [row["fact"]]
     except Exception as e:  # noqa: BLE001
         logger.error(f"Forget failed: {e}", exc_info=True)
         return []

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from jarvis.config import ALLOWED_FILE_ROOTS
 
 
 def get_system_time() -> str:
@@ -35,7 +36,13 @@ def get_directory_contents(directory: str = ".") -> str:
     Returns:
         A formatted string listing files and subdirectories.
     """
-    dir_path = Path(directory).expanduser().resolve()
+    try:
+        dir_path = Path(directory).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return f"Directory '{directory}' does not exist or cannot be resolved."
+
+    if not any(dir_path == root or root in dir_path.parents for root in ALLOWED_FILE_ROOTS):
+        return f"Access denied: '{directory}' is outside the allowed directories."
 
     if not dir_path.exists():
         return f"Directory '{directory}' does not exist."
@@ -56,10 +63,19 @@ def get_directory_contents(directory: str = ".") -> str:
     for entry in entries:
         if entry.name.startswith("."):
             continue  # Skip hidden files for brevity
+        try:
+            target = entry.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not any(target == root or root in target.parents for root in ALLOWED_FILE_ROOTS):
+            continue
         if entry.is_dir():
             dirs.append(f"[DIR]  {entry.name}/")
         else:
-            size = entry.stat().st_size
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                continue
             size_str = _format_size(size)
             files.append(f"[FILE] {entry.name} ({size_str})")
 
