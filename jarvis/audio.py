@@ -1,10 +1,10 @@
 """Phase 4 — one microphone, shared by wake word, VAD and ASR.
 
 The rule this module exists to enforce: **exactly one process opens the
-microphone.** Previously the wake-word listener held a PyAudio stream while
-`speech.listen()` opened a second one through ``speech_recognition.Microphone``
-— two owners of one device, which is how you get "device busy" failures on some
-machines and a silent mic on others.
+microphone.** Previously the wake-word listener and
+`speech.listen()` could open two capture streams through
+``speech_recognition.Microphone`` — two owners of one device, which is how you
+get "device busy" failures on some machines and a silent mic on others.
 
 ```text
 Microphone  ->  MicrophoneStream  ->  [sinks: wake word, VAD, ASR]
@@ -21,6 +21,7 @@ fake microphone and no audio hardware.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ import numpy as np
 from jarvis.config import (
     AUDIO_CHANNELS,
     AUDIO_FRAME_MS,
+    AUDIO_INPUT_DEVICE,
     AUDIO_SAMPLE_RATE,
     VAD_BARGE_IN_SNR,
     VAD_BARGE_IN_MS,
@@ -536,74 +538,93 @@ class MicrophoneUnavailable(RuntimeError):
     """The input device could not be opened. Never raised past ``start``."""
 
 
-class PyAudioSource:
-    """The real device: PyAudio, int16 mono at the configured rate."""
+class SoundDeviceSource:
+    """Microphone capture through sounddevice (PortAudio).
 
-    def __init__(self, device: Optional[int] = None, rate: int = SAMPLE_RATE,
-                 frame_size: Optional[int] = None):
+    The device callback pushes frames into a bounded queue. read() blocks until a
+    frame arrives or the timeout expires. A timeout returns None, which is normal.
+    Any other failure raises, so the caller can see it.
+    """
+
+    def __init__(self, device=None, rate=SAMPLE_RATE, frame_ms=AUDIO_FRAME_MS, max_queued=200):
         self.device = device
-        self.rate = rate
-        #: Bytes per read. Named for the PyAudio argument it feeds.
-        self.frame_size = frame_size or frame_bytes()
-        self._audio = None
+        self.rate = int(rate)
+        self.block = int(self.rate * frame_ms / 1000)   # samples per frame
+        self.frame_size = self.block * 2                 # bytes per frame, int16 mono
+        self._queue = queue.Queue(maxsize=max_queued)
         self._stream = None
-
-    def open(self) -> None:
-        try:
-            import pyaudio
-        except ImportError as e:
-            raise MicrophoneUnavailable(
-                "PyAudio is not installed; voice input needs `pyaudio`."
-            ) from e
-
-        audio = pyaudio.PyAudio()
-        try:
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=AUDIO_CHANNELS,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.frame_size,
-                input_device_index=self.device,
-            )
-        except Exception as e:  # noqa: BLE001
-            audio.terminate()
-            raise MicrophoneUnavailable(
-                f"No usable microphone ({e}). Voice input is unavailable; "
-                f"text conversation still works."
-            ) from e
-        self._audio = audio
-        self._stream = stream
-
-    def read(self) -> Optional[bytes]:
-        if self._stream is None:
-            return None
-        try:
-            return self._stream.read(self.frame_size, exception_on_overflow=False)
-        except Exception:  # noqa: BLE001 - a transient read error is not fatal
-            return None
-
-    def close(self) -> None:
-        # Release in the reverse order of acquisition. The wake-word listener
-        # previously returned on wake without doing this, which left the device
-        # held for the rest of the process.
-        if self._stream is not None:
-            try:
-                self._stream.stop_stream()
-                self._stream.close()
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"microphone stream close reported: {e}")
-            self._stream = None
-        if self._audio is not None:
-            try:
-                self._audio.terminate()
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"PyAudio terminate reported: {e}")
-            self._audio = None
+        self.device_name = ""
+        self.overflows = 0
 
     @property
     def is_open(self) -> bool:
         return self._stream is not None
+
+    def open(self) -> None:
+        try:
+            import sounddevice as sd
+        except ImportError as e:
+            raise MicrophoneUnavailable(
+                "sounddevice is not installed. Run: pip install sounddevice") from e
+
+        try:
+            info = sd.query_devices(self.device, "input")
+        except Exception as e:
+            raise MicrophoneUnavailable(f"no input device found: {e}") from e
+        self.device_name = info.get("name", "unknown")
+
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.rate,
+                channels=1,
+                dtype="int16",
+                blocksize=self.block,
+                device=self.device,
+                callback=self._callback,
+            )
+            self._stream.start()
+        except Exception as e:
+            self._stream = None
+            raise MicrophoneUnavailable(
+                f"could not open '{self.device_name}': {e}. On macOS, allow your terminal "
+                "under System Settings > Privacy and Security > Microphone."
+            ) from e
+        logger.info(f"[AUDIO] microphone: {self.device_name}")
+
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            self.overflows += 1
+        chunk = indata.tobytes()
+        try:
+            self._queue.put_nowait(chunk)
+        except queue.Full:
+            # Keep the newest audio: drop the oldest frame instead of blocking the device.
+            self.overflows += 1
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(chunk)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def read(self, timeout: float = 1.0) -> Optional[bytes]:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"microphone close reported: {e}")
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
 
 class MicrophoneStream:
@@ -621,7 +642,7 @@ class MicrophoneStream:
         clock: Callable[[], float] = time.monotonic,
         on_error: Optional[Callable[[str], None]] = None,
     ):
-        self.source = source or PyAudioSource()
+        self.source = source or SoundDeviceSource(device=AUDIO_INPUT_DEVICE)
         self.clock = clock
         self.on_error = on_error
         self._sinks: List[Callable[[bytes], None]] = []
@@ -685,15 +706,24 @@ class MicrophoneStream:
     # -- reading ---------------------------------------------------------
 
     def _pump(self) -> None:
-        """Blocking read loop. No polling: `read` waits for the device."""
+        """Read loop. Failures are counted, logged, and retried. They are never hidden."""
+        failures = 0
         while not self._stop.is_set():
-            pcm = self.source.read()
-            if pcm is None:
-                if self._stop.is_set():
-                    break
-                if self.source.is_open:
-                    continue  # transient read error, keep going
-                break
+            try:
+                pcm = self.source.read()
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                self.last_error = f"read failed: {e}"
+                logger.error(f"[AUDIO] microphone read failed ({failures}): {e}")
+                if failures >= 20:
+                    self.available = False
+                    logger.error("[AUDIO] giving up on the microphone after repeated read failures")
+                    return
+                time.sleep(min(0.05 * failures, 0.5))
+                continue
+            if pcm is None:          # timeout with no audio is normal: keep waiting
+                continue
+            failures = 0
             self.frames_read += 1
             with self._lock:
                 sinks = list(self._sinks)
@@ -724,7 +754,7 @@ __all__ = [
     "EchoGuard",
     "MicrophoneStream",
     "MicrophoneUnavailable",
-    "PyAudioSource",
+    "SoundDeviceSource",
     "SpeechEvent",
     "VoiceActivityDetector",
     "frame_bytes",
